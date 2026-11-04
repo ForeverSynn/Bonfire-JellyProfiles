@@ -1,0 +1,25 @@
+# lsheardo: build check for the Jellyfin 12.4 rebuild (Media-Serv). Upstream workflows only run on their own branches.
+name: lsheardo 12.4 build
+on:
+  push:
+    branches: ['lsheardo-*']
+  pull_request:
+    branches: ['lsheardo-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Publish
+        run: dotnet publish Jellyfin.Profiles.csproj -c Release -o out -p:TreatWarningsAsErrors=false -p:BonfireTfm=net10.0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-12.4
+          path: out/

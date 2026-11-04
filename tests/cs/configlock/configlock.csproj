@@ -19,8 +19,8 @@
        IL of BasePlugin<T>.UpdateConfiguration to prove the configuration instance really is
        replaced. So no ExcludeAssets here — the DLL must land in the output folder. -->
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Common" Version="10.11.5" />
-    <PackageReference Include="Jellyfin.Model" Version="10.11.5" />
+    <PackageReference Include="Jellyfin.Common" Version="12.4.0" />
+    <PackageReference Include="Jellyfin.Model" Version="12.4.0" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="Jellyfin.Profiles">

@@ -18,10 +18,10 @@
   <!-- PluginConfiguration derives from BasePluginConfiguration in MediaBrowser.Model,
        so reflecting on it needs the model assembly present at run time. -->
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Common" Version="10.11.5" />
-    <PackageReference Include="Jellyfin.Controller" Version="10.11.5" />
-    <PackageReference Include="Jellyfin.Model" Version="10.11.5" />
-    <PackageReference Include="Jellyfin.Extensions" Version="10.11.5" />
+    <PackageReference Include="Jellyfin.Common" Version="12.4.0" />
+    <PackageReference Include="Jellyfin.Controller" Version="12.4.0" />
+    <PackageReference Include="Jellyfin.Model" Version="12.4.0" />
+    <PackageReference Include="Jellyfin.Extensions" Version="12.4.0" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="Jellyfin.Profiles">

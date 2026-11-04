@@ -19,8 +19,8 @@
        the controller's helpers sit on a type whose base needs MediaBrowser.Common. The
        server supplies both at runtime; a harness has no server. -->
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Common" Version="10.11.5" />
-    <PackageReference Include="Jellyfin.Model" Version="10.11.5" />
+    <PackageReference Include="Jellyfin.Common" Version="12.4.0" />
+    <PackageReference Include="Jellyfin.Model" Version="12.4.0" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="Jellyfin.Profiles">

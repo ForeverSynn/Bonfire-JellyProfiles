@@ -9,7 +9,7 @@
          net9.0 is still what ships: it is the only one of the two that serves BOTH servers,
          so one artefact and one manifest entry covers everybody. See the packaging step in
          release.yml, which names net9.0 deliberately. -->
-    <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>Jellyfin.Profiles</AssemblyName>
@@ -25,15 +25,15 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Controller" Version="10.11.5">
+    <PackageReference Include="Jellyfin.Controller" Version="12.4.0">
       <PrivateAssets>all</PrivateAssets>
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>
-    <PackageReference Include="Jellyfin.Model" Version="10.11.5">
+    <PackageReference Include="Jellyfin.Model" Version="12.4.0">
       <PrivateAssets>all</PrivateAssets>
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>
-    <PackageReference Include="Jellyfin.Common" Version="10.11.5">
+    <PackageReference Include="Jellyfin.Common" Version="12.4.0">
       <PrivateAssets>all</PrivateAssets>
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>
@@ -42,7 +42,7 @@
          are not decoration: without them enums become integers and Guids grow dashes, and
          a client that parses one of those crashes. Byte-identical between 10.11 and 12.0,
          and runtime-excluded like the rest — the server supplies its own copy. -->
-    <PackageReference Include="Jellyfin.Extensions" Version="10.11.5">
+    <PackageReference Include="Jellyfin.Extensions" Version="12.4.0">
       <PrivateAssets>all</PrivateAssets>
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>

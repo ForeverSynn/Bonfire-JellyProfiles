@@ -1,0 +1,9 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "baseBranches": ["lsheardo-12.4"],
+  "enabledManagers": ["nuget", "github-actions"],
+  "packageRules": [
+    { "matchManagers": ["nuget"], "matchPackageNames": ["/^Jellyfin\\./"], "groupName": "Jellyfin server packages" }
+  ]
+}

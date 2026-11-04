@@ -20,8 +20,8 @@
        MediaBrowser.Common. The plugin itself excludes these at runtime because the server
        supplies them; a harness has no server. -->
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Common" Version="10.11.5" />
-    <PackageReference Include="Jellyfin.Model" Version="10.11.5" />
+    <PackageReference Include="Jellyfin.Common" Version="12.4.0" />
+    <PackageReference Include="Jellyfin.Model" Version="12.4.0" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="Jellyfin.Profiles">
