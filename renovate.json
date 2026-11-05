@@ -1,9 +1,52 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
-  "baseBranches": ["lsheardo-12.4"],
-  "enabledManagers": ["nuget", "github-actions"],
+  "description": "ForeverSynn Renovate standard (Media-Serv, 5 Nov 2026; server docs/reference.md \"Renovate standard\"). Plugin fork: our build branch lsheardo-12.4 is the default branch. Jellyfin.* packages must match the server's Jellyfin (12.4): they move only with a Jellyfin upgrade (jellyfin-plugin-rebuild), so they wait for a dashboard tick.",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "America/Toronto",
+  "schedule": [
+    "* 0-5 * * 1"
+  ],
+  "minimumReleaseAge": "3 days",
+  "dependencyDashboard": true,
+  "prConcurrentLimit": 5,
+  "labels": [
+    "dependencies"
+  ],
+  "rebaseWhen": "conflicted",
+  "vulnerabilityAlerts": {
+    "labels": [
+      "security"
+    ],
+    "schedule": [
+      "at any time"
+    ],
+    "minimumReleaseAge": null
+  },
   "packageRules": [
-    { "matchManagers": ["nuget"], "matchPackageNames": ["/^Jellyfin\\./"], "groupName": "Jellyfin server packages" }
+    {
+      "description": "Major updates wait for a tick on the Dependency Dashboard",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Jellyfin server packages: only together with a Jellyfin upgrade",
+      "matchManagers": [
+        "nuget"
+      ],
+      "matchPackageNames": [
+        "/^Jellyfin\\./"
+      ],
+      "groupName": "Jellyfin server packages",
+      "dependencyDashboardApproval": true
+    }
+  ],
+  "enabledManagers": [
+    "nuget",
+    "github-actions"
   ]
 }
