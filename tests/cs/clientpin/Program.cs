@@ -1401,6 +1401,7 @@ public class RecordingUserManager : DispatchProxy
                 return Task.CompletedTask;
 
             case "get_Users":
+            case "GetUsers":   // lsheardo-12.4: IUserManager.Users became GetUsers() (10.11.7+, 12.x)
                 return _users.Values.ToList();
 
             default:
