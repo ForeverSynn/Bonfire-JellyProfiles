@@ -9,6 +9,7 @@ using Jellyfin.Database.Implementations.Entities.Security;
 using MediaBrowser.Controller.Devices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Jellyfin.Extensions.Json;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Configuration;
@@ -76,8 +77,16 @@ var dto = new UserDto
     Name = "Bardkids",
     Id = profileId,
     ServerId = "abc123",
+    HasPassword = true,
+    HasConfiguredPassword = true,
+    PrimaryImageTag = "tag1",
+    EnableAutoLogin = false,
+    LastLoginDate = new DateTime(2026, 11, 1, 12, 0, 0, DateTimeKind.Utc),
+    LastActivityDate = new DateTime(2026, 11, 2, 12, 0, 0, DateTimeKind.Utc),
     Policy = new UserPolicy
     {
+        IsAdministrator = true,
+        BlockedTags = new[] { "secret-tag" },
         SyncPlayAccess = SyncPlayUserAccessType.JoinGroups,
         BlockUnratedItems = new[] { UnratedItem.Movie, UnratedItem.Series },
         AuthenticationProviderId = "x",
@@ -112,12 +121,35 @@ Ok("a profile is added to an empty list", produced != null);
 var json = produced == null ? "" : Encoding.UTF8.GetString(produced);
 Console.WriteLine("        " + (json.Length > 150 ? json.Substring(0, 150) + "…" : json));
 
-// The two that crashed the app, checked as values rather than as "it looks like JSON".
-Ok("enums are written as strings, not integers",
-   json.Contains("\"JoinGroups\"", StringComparison.Ordinal),
-   "SyncPlayAccess came out as a number — no JsonStringEnumConverter");
-Ok("enum arrays too", json.Contains("\"Movie\"", StringComparison.Ordinal));
-Ok("and nested configuration enums", json.Contains("\"Always\"", StringComparison.Ordinal));
+// R-1043: this is an anonymous endpoint, and the entry used to be Jellyfin's whole UserDto:
+// Policy (administrator, folders, tags, schedules), Configuration, last login. Only what a
+// tile is drawn from is written now, so the enums that crashed 1.6.1.2 (Policy's SyncPlayAccess
+// and BlockUnratedItems, Configuration's SubtitleMode) are no longer in the entry at all, and
+// the three assertions that checked they were written as strings have nothing to check. The
+// Guid assertions below still apply to the ids that are written.
+Ok("the account's policy is not published", !json.Contains("Policy", StringComparison.OrdinalIgnoreCase)
+   && !json.Contains("IsAdministrator", StringComparison.OrdinalIgnoreCase) && !json.Contains("secret-tag", StringComparison.Ordinal));
+Ok("nor its configuration", !json.Contains("Configuration\"", StringComparison.OrdinalIgnoreCase)
+   && !json.Contains("SubtitleMode", StringComparison.OrdinalIgnoreCase));
+Ok("nor when it last signed in or was active", !json.Contains("LastLoginDate", StringComparison.OrdinalIgnoreCase)
+   && !json.Contains("LastActivityDate", StringComparison.OrdinalIgnoreCase));
+{
+    var entry = (JsonNode.Parse(json) as JsonArray)?[0] as JsonObject;
+    var keys = entry == null ? "" : string.Join(",", entry.Select(p => p.Key).OrderBy(k => k));
+    Ok("it carries exactly what a tile is drawn from", keys == "EnableAutoLogin,HasConfiguredEasyPassword,HasConfiguredPassword,HasPassword,Id,Name,PrimaryImageTag,ServerId", keys);
+
+    // Issue #43. Wholphin and the current Android TV release parse this list with
+    // jellyfin-sdk-kotlin 1.7.1, whose UserDto has no default for these four. One entry
+    // without one fails the whole list, so the app shows an error instead of a picker.
+    // Named one at a time: "what a tile is drawn from" was the coarser question.
+    foreach (var required in new[] { "Id", "HasPassword", "HasConfiguredPassword", "HasConfiguredEasyPassword" })
+    {
+        Ok("the Kotlin SDK's required field " + required + " is there", entry != null && entry.ContainsKey(required), keys);
+    }
+
+    Ok("with the values Jellyfin gave", entry != null && (string)entry["PrimaryImageTag"] == "tag1" && (bool)entry["HasPassword"]
+       && (bool)entry["HasConfiguredPassword"] && (string)entry["ServerId"] == "abc123");
+}
 
 Ok("Guids are dashless, the way Jellyfin writes them",
    json.Contains("8e3cdfa579a84bb9bd9a0e96b7dc974a", StringComparison.OrdinalIgnoreCase),
@@ -163,8 +195,12 @@ if (parsed != null)
     Ok("with exactly one user in it", parsed.Length == 1, parsed.Length.ToString());
     Ok("the id survives", parsed[0].Id == profileId);
     Ok("the name survives", parsed[0].Name == "Bardkids");
-    Ok("and the enum survives as its own value",
-       parsed[0].Policy?.SyncPlayAccess == SyncPlayUserAccessType.JoinGroups);
+    // Was "the enum survives as its own value" (Policy.SyncPlayAccess); see R-1043 above.
+    // (Not asserted as Policy == null: Jellyfin's own UserDto fills a missing Policy with a
+    // default one, so that says nothing about the wire. "the account's policy is not
+    // published" above checks the bytes.)
+    Ok("and nothing of the real policy came back through it", parsed[0].Policy?.IsAdministrator != true && parsed[0].Policy?.SyncPlayAccess != SyncPlayUserAccessType.JoinGroups);
+    Ok("the flags a password box needs survive", parsed[0].HasPassword == true && parsed[0].PrimaryImageTag == "tag1");
 }
 
 Console.WriteLine();
@@ -174,8 +210,9 @@ var camel = Encoding.UTF8.GetString(Run("application/json; profile=\"CamelCase\"
 Ok("camelCase is honoured when the response asked for it",
    camel.Contains("\"name\"", StringComparison.Ordinal)
    && !camel.Contains("\"Name\"", StringComparison.Ordinal));
-Ok("and camelCase still writes enums as strings",
-   camel.Contains("\"JoinGroups\"", StringComparison.Ordinal));
+// Was "camelCase still writes enums as strings"; the entry has no enums now (R-1043).
+Ok("and camelCase carries the same reduced entry",
+   camel.Contains("\"hasPassword\"", StringComparison.Ordinal) && !camel.Contains("policy", StringComparison.OrdinalIgnoreCase));
 
 UserDto[] camelParsed = null;
 try { camelParsed = JsonSerializer.Deserialize<UserDto[]>(camel, JsonDefaults.CamelCaseOptions); }
@@ -486,6 +523,43 @@ if (resolve != null)
         devicesList.Clear();
         record.Invoke(null, new object[] { config, null, "TV", "Android TV", MASTER, now, null });
         Ok("a sign-in with no device id records nothing", devicesList.Count == 0);
+
+        // One browser or Roku, two households (R-1050). It stayed the first one's for good:
+        // the second could not restrict a profile to it, and once a PIN needed a household
+        // device (R-1344), its PINs were refused there.
+        var NEIGHBOUR = Guid.NewGuid();
+        devicesList.Clear();
+        record.Invoke(null, new object[] { config, "tv-shared", "Lounge", "Roku", MASTER, now, null });
+        record.Invoke(null, new object[] { config, "tv-shared", "Lounge", "Roku", NEIGHBOUR, now, null });
+        var shared = devicesList.Count == 1 ? devicesList[0] : null;
+        var ownedBy = knownType.GetMethod("OwnedBy");
+        Ok("a second household on the same device owns it too",
+           shared != null && ownedBy != null && (bool)ownedBy.Invoke(shared, new object[] { NEIGHBOUR })
+           && (bool)ownedBy.Invoke(shared, new object[] { MASTER }));
+        Ok("and its sign-in screen shows whoever was there last",
+           shared != null && (Guid)knownType.GetProperty("MasterUserId").GetValue(shared) == NEIGHBOUR);
+        record.Invoke(null, new object[] { config, "tv-shared", "Lounge", "Roku", MASTER, now, null });
+        Ok("which goes back when the first signs in again, both still owning it",
+           shared != null && ownedBy != null
+           && (Guid)knownType.GetProperty("MasterUserId").GetValue(shared) == MASTER
+           && (bool)ownedBy.Invoke(shared, new object[] { NEIGHBOUR }));
+
+        var isOwnedBy = registry.GetMethod("IsOwnedBy", BindingFlags.Public | BindingFlags.Static);
+        Ok("each household is recognised there, under the id the app sends",
+           isOwnedBy != null
+           && (bool)isOwnedBy.Invoke(null, new object[] { config, " tv-shared", NEIGHBOUR })
+           && (bool)isOwnedBy.Invoke(null, new object[] { config, "tv-shared", MASTER })
+           && !(bool)isOwnedBy.Invoke(null, new object[] { config, "tv-shared", Guid.NewGuid() })
+           && !(bool)isOwnedBy.Invoke(null, new object[] { config, "tv-shared", Guid.Empty }));
+
+        // Both households' device lists include it, so either can restrict a profile to it.
+        var scope = asm.GetType("Jellyfin.Profiles.Controllers.ProfilesBaseController", true)
+            .GetMethod("ScopeDevicesToHousehold", BindingFlags.NonPublic | BindingFlags.Static);
+        int Listed(Guid household) => scope == null ? -1 : ((System.Collections.IList)scope.Invoke(null, new object[]
+            { devicesList, household, new HashSet<string>(StringComparer.OrdinalIgnoreCase) })).Count;
+        Ok("and it is on both households' device lists", Listed(MASTER) == 1 && Listed(NEIGHBOUR) == 1);
+        Ok("but on nobody else's", Listed(Guid.NewGuid()) == 0);
+        devicesList.Clear();
     }
 
     Console.WriteLine();
@@ -1222,7 +1296,8 @@ Console.WriteLine("── Why a profile goes missing from one television ──�
 
             var task = (System.Threading.Tasks.Task)mw.GetMethod("Invoke").Invoke(instance, new object[]
             {
-                ctx, null, UserManagerStub.Create(profileId, dto), DeviceManagerStub.Create("mw-tv", null, DateTime.UtcNow)
+                ctx, null, UserManagerStub.Create(profileId, dto), DeviceManagerStub.Create("mw-tv", null, DateTime.UtcNow),
+                null, null, null
             });
             await task;
             return (Encoding.UTF8.GetString(sink.ToArray()), (string)logger.GetType().GetProperty("All").GetValue(logger));

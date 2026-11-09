@@ -255,7 +255,21 @@ namespace Jellyfin.Profiles.Auth
                 // against the throttle. A master's ordinary password sign-in, on the web or
                 // anywhere else, comes through here too and must never use up the PIN
                 // allowance or be slowed by it.
-                if (master != null && !Plugin.IsPanicDisabled && LooksLikePin(password))
+                //
+                // And only on a device this household has signed in on with a password
+                // (R-1344). This branch had no device check at all, so an administrator's four
+                // digits opened the server from any address on the internet. Elsewhere the
+                // PIN is skipped, not refused: the password below still works there.
+                if (master != null && !Plugin.IsPanicDisabled && LooksLikePin(password)
+                    && !KnownToHousehold(config, deviceId, resolvedUser.Id))
+                {
+                    _logger.LogInformation(
+                        "ProfilesPlugin: a PIN for master account {UserId} from device {DeviceId}, which it has "
+                        + "not signed in on with its password; only the password is being checked.",
+                        resolvedUser.Id,
+                        string.IsNullOrEmpty(deviceId) ? "(none sent)" : deviceId);
+                }
+                else if (master != null && !Plugin.IsPanicDisabled && LooksLikePin(password))
                 {
                     if (!BeginPinAttempt(resolvedUser.Id))
                     {
@@ -287,6 +301,20 @@ namespace Jellyfin.Profiles.Auth
             // Every PIN below belongs to a sub-profile, and the emergency disable turns PIN
             // entry off. A sub-profile has no password of its own to fall back to.
             if (Plugin.IsPanicDisabled) throw Decline();
+
+            // A main account turned off in Dashboard -> Users shuts its profiles too (R-1135).
+            // Jellyfin checks the account being signed into, which is the profile's and was
+            // never the one turned off, so a PIN went on opening them. A master that can't be
+            // found is not "disabled": this only ever removes access.
+            if (_services?.GetService(typeof(IUserManager)) is IUserManager accounts
+                && accounts.GetUserById(mapping.MasterUserId) is User mainAccount
+                && Jellyfin.Data.UserEntityExtensions.HasPermission(mainAccount, Jellyfin.Database.Implementations.Enums.PermissionKind.IsDisabled))
+            {
+                _logger.LogWarning(
+                    "ProfilesPlugin: refused a sign-in to profile {ProfileId}, whose main account is turned off.",
+                    mapping.ProfileUserId);
+                throw Decline();
+            }
 
             // A profile limited to particular devices is limited here too.
             //
@@ -341,9 +369,7 @@ namespace Jellyfin.Profiles.Auth
                 // box does anything would otherwise be let in.
                 if (!string.IsNullOrEmpty(password)) throw Decline();
 
-                var seenFor = DeviceRegistry.FindMaster(config, deviceId);
-
-                if (seenFor == Guid.Empty || seenFor != mapping.MasterUserId)
+                if (!KnownToHousehold(config, deviceId, mapping.MasterUserId))
                 {
                     _logger.LogWarning(
                         "ProfilesPlugin: refused to open PIN-less profile {ProfileId} from device {DeviceId}, "
@@ -364,6 +390,21 @@ namespace Jellyfin.Profiles.Auth
             // Nothing that is not PIN-shaped can match, so it is refused without spending a
             // key derivation on it or an attempt from the allowance.
             if (!LooksLikePin(password)) throw Decline();
+
+            // A PIN only works on a device the household has signed in on with a password
+            // (R-1344, Logan's rule for every account). It used to stand on its own here, so
+            // a profile typed by its full system name ("Bard_Family") was four digits from
+            // anywhere. Checked before the allowance, so a stranger's guesses cannot pause
+            // the PIN for the household's own television either.
+            if (!KnownToHousehold(config, deviceId, mapping.MasterUserId))
+            {
+                _logger.LogWarning(
+                    "ProfilesPlugin: refused a PIN for profile {ProfileId} from device {DeviceId}, which this "
+                    + "household has not signed in on.",
+                    mapping.ProfileUserId,
+                    string.IsNullOrEmpty(deviceId) ? "(none sent)" : deviceId);
+                throw Decline();
+            }
 
             // Jellyfin's own lockout does not cover this: LoginAttemptsBeforeLockout is null
             // on every account Bonfire creates, and Jellyfin reads null as "never lock". A
@@ -435,6 +476,15 @@ namespace Jellyfin.Profiles.Auth
                 "A Bonfire profile's PIN is changed in Bonfire, not as an account password.");
         }
 
+        /// <summary>
+        /// True if <paramref name="householdId"/> has signed in on this device with its
+        /// password: the record <see cref="BonfireSessionListener"/> writes. A device id is
+        /// client-supplied, so this raises the bar from "anywhere" to "an id this household
+        /// uses"; the PIN is still the credential.
+        /// </summary>
+        private static bool KnownToHousehold(PluginConfiguration? config, string? deviceId, Guid householdId)
+            => DeviceRegistry.IsOwnedBy(config, deviceId, householdId);
+
         /// <summary>A PIN as Bonfire accepts one: four to eight digits.</summary>
         private static bool LooksLikePin(string? value)
             => !string.IsNullOrEmpty(value)
@@ -442,25 +492,14 @@ namespace Jellyfin.Profiles.Auth
                && value.All(char.IsAsciiDigit);
 
         /// <summary>
-        /// Counts one PIN attempt against this account and says whether it may be made.
-        /// Counted before the PIN is checked, so parallel guesses cannot all pass the check
-        /// together. Both windows are consulted every time.
+        /// Counts one PIN attempt against this account and says whether it may be made: the
+        /// account's one allowance, shared with the web (<see cref="Controllers.PinBudget"/>).
+        /// Counted before the PIN is checked, so parallel guesses cannot all pass together.
         /// </summary>
-        private static bool BeginPinAttempt(Guid userId)
-        {
-            var key = userId.ToString("N");
-            var shortWindow = Controllers.RateLimiter.ClientPin.TryBegin(key);
-            var day = Controllers.RateLimiter.ClientPinDaily.TryBegin(key);
-            return shortWindow && day;
-        }
+        internal static bool BeginPinAttempt(Guid userId) => Controllers.PinBudget.TryBegin(userId);
 
         /// <summary>A PIN was right: the account's allowance starts again.</summary>
-        private static void EndPinAttempt(Guid userId)
-        {
-            var key = userId.ToString("N");
-            Controllers.RateLimiter.ClientPin.Reset(key);
-            Controllers.RateLimiter.ClientPinDaily.Reset(key);
-        }
+        internal static void EndPinAttempt(Guid userId) => Controllers.PinBudget.End(userId);
 
         /// <summary>
         /// Whether Jellyfin has this account bound to this provider — the one case where

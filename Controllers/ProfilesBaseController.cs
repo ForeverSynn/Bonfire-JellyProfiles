@@ -94,6 +94,22 @@ namespace Jellyfin.Profiles.Controllers
         }
 
         /// <summary>
+        /// True when <paramref name="mapping"/> is a sub-profile whose main account is turned
+        /// off in Dashboard -> Users.
+        /// </summary>
+        internal static bool MainAccountDisabled(IUserManager users, ProfileMapping? mapping)
+        {
+            // A master's own row, or none, is the account itself: its own IsDisabled is the
+            // check, and the callers make it. Turning a main account off never touched its
+            // profiles' accounts, which were checked alone, so they stayed enterable by PIN
+            // and by the switcher (R-1135). A master that can't be found is not "disabled":
+            // this only ever removes access, it does not invent a refusal.
+            if (mapping == null || mapping.MasterUserId == mapping.ProfileUserId) return false;
+            var master = users.GetUserById(mapping.MasterUserId);
+            return master != null && users.GetUserDto(master, string.Empty).Policy?.IsDisabled == true;
+        }
+
+        /// <summary>
         /// Should a switch to <paramref name="targetUserId"/> rewrite that account's policy
         /// from its master's? True only for a genuine sub-profile.
         /// </summary>
@@ -957,10 +973,9 @@ namespace Jellyfin.Profiles.Controllers
 
         /// <summary>
         /// Counts one PIN attempt for the web switcher, or returns the 429 to send. Per
-        /// address and profile, and per profile across every address — see
-        /// <see cref="RateLimiter.PinPerProfile"/>. Counted before the PIN is checked, so
-        /// concurrent guesses cannot all pass together. Pair with <see cref="EndPinAttempt"/>
-        /// on success.
+        /// address and profile, and against the account's one allowance across every door
+        /// (<see cref="PinBudget"/>). Counted before the PIN is checked, so concurrent guesses
+        /// cannot all pass together. Pair with <see cref="EndPinAttempt"/> on success.
         /// </summary>
         protected ActionResult? BeginPinAttempt(string addressKey, Guid profileId)
         {
@@ -969,10 +984,9 @@ namespace Jellyfin.Profiles.Controllers
                 return TooManyAttempts(RateLimiter.Pin, addressKey, "Too many failed PIN attempts.");
             }
 
-            var profileKey = profileId.ToString("N");
-            if (!RateLimiter.PinPerProfile.TryBegin(profileKey))
+            if (!PinBudget.TryBegin(profileId))
             {
-                return TooManyAttempts(RateLimiter.PinPerProfile, profileKey, "Too many failed PIN attempts.");
+                return TooManyAttempts(PinBudget.RetryAfter(profileId), "Too many failed PIN attempts.");
             }
 
             return null;
@@ -982,7 +996,7 @@ namespace Jellyfin.Profiles.Controllers
         protected static void EndPinAttempt(string addressKey, Guid profileId)
         {
             RateLimiter.Pin.Reset(addressKey);
-            RateLimiter.PinPerProfile.Reset(profileId.ToString("N"));
+            PinBudget.End(profileId);
         }
 
         /// <summary>
@@ -993,10 +1007,12 @@ namespace Jellyfin.Profiles.Controllers
         /// </summary>
         protected bool VerifyMasterPinLimited(string? pin, ProfileMapping masterMapping, PluginConfiguration config, out ActionResult? refusal)
         {
-            var key = "master-pin:" + masterMapping.ProfileUserId.ToString("N");
-            if (!RateLimiter.PinPerProfile.TryBegin(key))
+            // The same allowance as every other door to this PIN (PinBudget). It had its own,
+            // ten a quarter hour with no daily cap, and a child reaches it through "more time".
+            var mainId = masterMapping.ProfileUserId;
+            if (!PinBudget.TryBegin(mainId))
             {
-                refusal = TooManyAttempts(RateLimiter.PinPerProfile, key, "Too many failed PIN attempts.");
+                refusal = TooManyAttempts(PinBudget.RetryAfter(mainId), "Too many failed PIN attempts.");
                 return false;
             }
 
@@ -1006,7 +1022,7 @@ namespace Jellyfin.Profiles.Controllers
                 return false;
             }
 
-            RateLimiter.PinPerProfile.Reset(key);
+            PinBudget.End(mainId);
             refusal = null;
             return true;
         }
@@ -1023,8 +1039,10 @@ namespace Jellyfin.Profiles.Controllers
         /// </para>
         /// </summary>
         internal ActionResult TooManyAttempts(RateLimiter limiter, string key, string what)
+            => TooManyAttempts(limiter.RetryAfter(key), what);
+
+        internal ActionResult TooManyAttempts(TimeSpan wait, string what)
         {
-            var wait = limiter.RetryAfter(key);
             if (wait > TimeSpan.Zero)
             {
                 Response.Headers["Retry-After"] =
@@ -1226,6 +1244,10 @@ namespace Jellyfin.Profiles.Controllers
         /// </summary>
         internal static List<Guid> ProfilesLeftUnrestrictedBy(
             PluginConfiguration config, IEnumerable<string> removingIds)
+            => HouseholdProfilesLeftUnrestrictedBy(config, removingIds, null);
+
+        internal static List<Guid> HouseholdProfilesLeftUnrestrictedBy(
+            PluginConfiguration config, IEnumerable<string> removingIds, Guid? householdId)
         {
             var removing = removingIds
                 .Where(id => !string.IsNullOrWhiteSpace(id))
@@ -1238,6 +1260,8 @@ namespace Jellyfin.Profiles.Controllers
             foreach (var m in config.Mappings)
             {
                 if (m.AllowedDeviceIds == null) continue;
+                // Only that household's profiles, when one is named (R-1048).
+                if (householdId.HasValue && m.MasterUserId != householdId.Value) continue;
 
                 var current = m.AllowedDeviceIds
                     .Where(id => !string.IsNullOrWhiteSpace(id))
@@ -1310,6 +1334,9 @@ namespace Jellyfin.Profiles.Controllers
             if (string.IsNullOrWhiteSpace(target.Client) && !string.IsNullOrWhiteSpace(source.Client))
                 target.Client = source.Client;
             if (target.MasterUserId == Guid.Empty) target.MasterUserId = source.MasterUserId;
+            // Every household that used either id still owns the one left (R-1050).
+            target.Owners = Auth.DeviceRegistry.AddOwners(target.Owners,
+                new[] { target.MasterUserId, source.MasterUserId }.Concat(source.Owners ?? new List<Guid>()).ToArray());
 
             config.KnownDevices.Remove(source);
             return true;
@@ -1549,7 +1576,7 @@ namespace Jellyfin.Profiles.Controllers
             ISet<string> whitelistedDeviceIds)
         {
             var devices = knownDevices
-                .Where(d => d.MasterUserId == masterUserId
+                .Where(d => d.OwnedBy(masterUserId)
                             || whitelistedDeviceIds.Contains(d.DeviceId))
                 .GroupBy(d => d.DeviceId, StringComparer.OrdinalIgnoreCase)
                 .Select(g => g.OrderByDescending(d => d.LastSeen).First())
@@ -1587,6 +1614,74 @@ namespace Jellyfin.Profiles.Controllers
                 }
             }
             return linked;
+        }
+
+        /// <summary>
+        /// Signs out every device that came into another household through a door that has
+        /// since closed: a kick, a leave, a deleted Bonfire, or the owner hiding its profiles
+        /// (R-1302). Each entry is asked what /switch would ask now, on the home network so a
+        /// LAN-only consent still counts as a door; one that would be refused is signed out
+        /// on that device only and forgotten. Never throws: the change that called it has
+        /// already been made and saved.
+        /// </summary>
+        protected async Task<int> SignOutClosedEntriesAsync()
+        {
+            var config = Plugin.Instance?.Configuration;
+            if (config == null) return 0;
+
+            List<CrossHouseholdEntry> entries;
+            List<ProfileMapping> mappings;
+            lock (ConfigLock)
+            {
+                entries = config.CrossHouseholdEntries?.Select(e => e.Copy()).ToList() ?? new List<CrossHouseholdEntry>();
+                mappings = config.Mappings.ToList();
+            }
+            if (entries.Count == 0) return 0;
+
+            var closed = new List<CrossHouseholdEntry>();
+            foreach (var e in entries)
+            {
+                var rules = EvaluateSwitch(mappings, e.EnteredBy, e.ProfileUserId,
+                    GetLinkedMasterUserIds(e.EnteredBy, config), isLocal: true);
+                if (rules.Unauthorized || rules.Refusal != null) closed.Add(e);
+                // In on the owner's home-network consent alone, which has since been withdrawn.
+                else if (e.WithoutPin && !string.IsNullOrEmpty(rules.Target?.PinHash) && !rules.HouseholdLanBypass) closed.Add(e);
+            }
+            if (closed.Count == 0) return 0;
+
+            lock (ConfigLock)
+            {
+                config.CrossHouseholdEntries?.RemoveAll(e => closed.Any(c => c.ProfileUserId == e.ProfileUserId
+                    && string.Equals(c.DeviceId, e.DeviceId, StringComparison.Ordinal)));
+                Plugin.Instance?.SaveConfiguration();
+            }
+
+            int signedOut = 0;
+            foreach (var e in closed)
+            {
+                try
+                {
+                    // The (account, device) pair: a device id alone would sign every account on
+                    // that television out, its own household's included.
+                    var devices = _deviceManager?.GetDevices(new Jellyfin.Data.Queries.DeviceQuery { DeviceId = e.DeviceId, UserId = e.ProfileUserId }).Items;
+                    if (devices == null) continue;
+                    foreach (var device in devices)
+                    {
+                        await _sessionManager.Logout(device).ConfigureAwait(false);
+                        signedOut++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "ProfilesPlugin: could not sign {ProfileId} out on device {DeviceId}.", e.ProfileUserId, e.DeviceId);
+                }
+            }
+
+            if (signedOut > 0)
+            {
+                _logger.LogInformation("ProfilesPlugin: signed out {Count} device(s) that had come in from another household.", signedOut);
+            }
+            return signedOut;
         }
 
         protected int GetMaxProfilesForUser(Guid userId, PluginConfiguration config)
@@ -1960,11 +2055,94 @@ namespace Jellyfin.Profiles.Controllers
         /// is a fair trade for a setting whose point is a consistent set.
         /// </para>
         /// </summary>
-        protected string? CopyLibraryAvatarToProfile(Guid profileId, string libraryAvatarId)
+        /// <para>
+        /// Answers (Url, Error), never a bare null: a null here was read by the callers as
+        /// "no picture", so a library avatar that did not exist removed the one the profile
+        /// had, with a 200 and no message (R-1108). Exactly one of the two is set.
+        /// </para>
+        protected (string? Url, string? Error) CopyLibraryAvatarToProfile(Guid profileId, string libraryAvatarId)
         {
+            var error = CheckLibraryAvatar(libraryAvatarId);
+            if (error != null) return (null, error);
+
             return CopyLibraryAvatar(libraryAvatarId, ProfileImageFolder, profileId.ToString())
-                ? $"/plugins/profiles/image/{profileId}?v={DateTime.UtcNow.Ticks}"
-                : null;
+                ? ($"/plugins/profiles/image/{profileId}?v={DateTime.UtcNow.Ticks}", null)
+                : (null, "That picture is no longer available.");
+        }
+
+        /// <summary>
+        /// Why a library avatar can't be chosen, or null. Writes nothing, so a caller can
+        /// refuse a request before it has changed anything else.
+        /// </summary>
+        protected string? CheckLibraryAvatar(string libraryAvatarId)
+        {
+            var config = Plugin.Instance?.Configuration;
+            if (StarterAvatars.IsStarterId(libraryAvatarId))
+            {
+                return StarterAvatars.Find(libraryAvatarId) != null && StarterAvatars.Enabled(config)
+                    ? null
+                    : "No such avatar.";
+            }
+
+            var item = config?.AvatarLibrary.FirstOrDefault(a =>
+                string.Equals(a.Id, libraryAvatarId, StringComparison.OrdinalIgnoreCase));
+            if (item == null) return "No such avatar.";
+            return FindImageFile(AvatarLibraryFolder, item.Id, false) == null ? "That picture is no longer available." : null;
+        }
+
+        /// <summary>
+        /// Why a picture can't be saved for <paramref name="profileId"/>, or null. Writes
+        /// nothing. The same rules <see cref="SaveProfileImage"/> applies, asked first so a
+        /// request that would be refused is refused before anything else in it is done.
+        /// </summary>
+        protected string? CheckProfileImage(Guid profileId, string? input, string? currentImage)
+        {
+            if (string.IsNullOrEmpty(input)) return null;
+
+            // Our own picture URL, and only this profile's: the unchanged current value, or
+            // its address with a cache-buster. Anything else under the prefix was stored
+            // unchecked, so a quote, "../" or another profile's URL could be written into
+            // what is later rendered into an img src (R-1109).
+            if (input.StartsWith("/plugins/profiles/image/", StringComparison.OrdinalIgnoreCase))
+            {
+                return IsOwnImageUrl(profileId, input) || string.Equals(input, currentImage, StringComparison.Ordinal)
+                    ? null
+                    : "Not a supported image.";
+            }
+
+            if (AreCustomAvatarsBlocked()) return "This server only allows pictures from the avatar library.";
+            if (IsValidImageUrl(input)) return null;
+            if (!input.StartsWith("data:image/", StringComparison.OrdinalIgnoreCase)) return "Not a supported image.";
+
+            var comma = input.IndexOf(',');
+            if (comma < 0) return "That image could not be read.";
+            var header = input.Substring(0, comma);
+            if (!StorableImageFormats.Any(f => header.Contains(f.Mime, StringComparison.OrdinalIgnoreCase)))
+                return "Not a supported image.";
+
+            try
+            {
+                return Convert.FromBase64String(input.Substring(comma + 1)).Length > MaxProfileImageBytes
+                    ? "That image is too large."
+                    : null;
+            }
+            catch (FormatException)
+            {
+                return "That image could not be read.";
+            }
+        }
+
+        private static bool IsOwnImageUrl(Guid profileId, string url)
+        {
+            const string prefix = "/plugins/profiles/image/";
+            var rest = url.Substring(prefix.Length);
+            var query = rest.IndexOf('?');
+            var id = query < 0 ? rest : rest.Substring(0, query);
+            if (!Guid.TryParse(id, out var parsed) || parsed != profileId) return false;
+            if (query < 0) return true;
+
+            var tail = rest.Substring(query);
+            return tail.Length > 3 && tail.StartsWith("?v=", StringComparison.Ordinal) && tail.Substring(3).All(char.IsAsciiDigit);
         }
 
         /// <summary>
@@ -1996,11 +2174,24 @@ namespace Jellyfin.Profiles.Controllers
                     return false;
                 }
 
+                // Copied beside the old picture first, and only swapped in once it is whole.
+                // It used to delete the old one and then copy: a copy that failed halfway
+                // left the profile with no picture at all (R-1108).
                 Directory.CreateDirectory(destFolder);
-                DeleteImageFiles(destFolder, baseName);
-                using (var target = System.IO.File.Create(Path.Combine(destFolder, baseName + StarterAvatars.Extension)))
+                var stagedStarter = Path.Combine(destFolder, baseName + ".tmp");
+                try
                 {
-                    source.CopyTo(target);
+                    using (var target = System.IO.File.Create(stagedStarter))
+                    {
+                        source.CopyTo(target);
+                    }
+
+                    DeleteImageFiles(destFolder, baseName);
+                    System.IO.File.Move(stagedStarter, Path.Combine(destFolder, baseName + StarterAvatars.Extension), true);
+                }
+                finally
+                {
+                    if (System.IO.File.Exists(stagedStarter)) System.IO.File.Delete(stagedStarter);
                 }
                 return true;
             }
@@ -2026,84 +2217,102 @@ namespace Jellyfin.Profiles.Controllers
             }
 
             Directory.CreateDirectory(destFolder);
-            DeleteImageFiles(destFolder, baseName);
 
-            bool copiedAny = false;
-            foreach (var (suffix, wantThumb) in new[] { (string.Empty, false), (ThumbSuffix, true) })
+            // Every file is copied beside the old ones first and swapped in after, so a copy
+            // that fails leaves the profile's current picture alone (R-1108).
+            var staged = new List<(string Temp, string Final)>();
+            try
             {
-                var source = FindImageFile(AvatarLibraryFolder, item.Id, wantThumb);
-                // FindImageFile falls back to the master when no thumbnail exists; only copy
-                // it into the thumbnail slot if it really is a distinct file.
-                if (source == null) continue;
-                if (wantThumb && !Path.GetFileNameWithoutExtension(source.Value.Path).EndsWith(ThumbSuffix, StringComparison.Ordinal))
-                    continue;
+                foreach (var (suffix, wantThumb) in new[] { (string.Empty, false), (ThumbSuffix, true) })
+                {
+                    var source = FindImageFile(AvatarLibraryFolder, item.Id, wantThumb);
+                    // FindImageFile falls back to the master when no thumbnail exists; only copy
+                    // it into the thumbnail slot if it really is a distinct file.
+                    if (source == null) continue;
+                    if (wantThumb && !Path.GetFileNameWithoutExtension(source.Value.Path).EndsWith(ThumbSuffix, StringComparison.Ordinal))
+                        continue;
 
-                var extension = Path.GetExtension(source.Value.Path);
-                System.IO.File.Copy(source.Value.Path, Path.Combine(destFolder, $"{baseName}{suffix}{extension}"), true);
-                copiedAny = true;
+                    var extension = Path.GetExtension(source.Value.Path);
+                    var final = Path.Combine(destFolder, $"{baseName}{suffix}{extension}");
+                    var temp = final + ".tmp";
+                    System.IO.File.Copy(source.Value.Path, temp, true);
+                    staged.Add((temp, final));
+                }
+
+                if (staged.Count == 0)
+                {
+                    _logger.LogWarning(
+                        "ProfilesPlugin: Library avatar {Avatar} is listed but has no file on disk.", item.Id);
+                    return false;
+                }
+
+                DeleteImageFiles(destFolder, baseName);
+                foreach (var (temp, final) in staged)
+                {
+                    System.IO.File.Move(temp, final, true);
+                }
+                return true;
             }
-
-            if (!copiedAny)
+            finally
             {
-                _logger.LogWarning(
-                    "ProfilesPlugin: Library avatar {Avatar} is listed but has no file on disk.", item.Id);
+                foreach (var (temp, _) in staged)
+                {
+                    if (System.IO.File.Exists(temp)) System.IO.File.Delete(temp);
+                }
             }
-
-            return copiedAny;
         }
 
-        protected string? SaveProfileImage(Guid profileId, string? profileImageInput, string? thumbInput = null)
+        /// <summary>
+        /// Saves a profile's picture. Answers (Url, Error): an empty input is a deliberate
+        /// removal and answers (null, null); a refusal answers (null, reason) and touches
+        /// nothing. It used to answer a bare null for both, and the callers stored that
+        /// straight into the profile, so a picture that was merely too large removed the
+        /// one already there, with a 200 and no message (R-1108).
+        /// </summary>
+        protected (string? Url, string? Error) SaveProfileImage(
+            Guid profileId, string? profileImageInput, string? thumbInput = null, string? currentImage = null)
         {
             var folder = ProfileImageFolder;
 
             if (string.IsNullOrEmpty(profileImageInput))
             {
                 DeleteImageFiles(folder, profileId.ToString());
-                return null;
+                return (null, null);
+            }
+
+            // Enforced by CheckProfileImage, not only by hiding the upload control, so a
+            // hand-written request cannot walk around a setting the administrator is
+            // relying on. A locked-down server accepts pictures solely through
+            // CopyLibraryAvatarToProfile.
+            var error = CheckProfileImage(profileId, profileImageInput, currentImage);
+            if (error != null)
+            {
+                _logger.LogWarning("ProfilesPlugin: Rejected a profile picture for {Id}: {Reason}", profileId, error);
+                return (null, error);
             }
 
             if (profileImageInput.StartsWith("/plugins/profiles/image/", StringComparison.OrdinalIgnoreCase))
-                return profileImageInput;
+                return (profileImageInput, null);
 
-            // Enforced here, not only by hiding the upload control, so a hand-written request
-            // cannot walk around a setting the administrator is relying on. A locked-down
-            // server accepts pictures solely through CopyLibraryAvatarToProfile.
-            if (AreCustomAvatarsBlocked())
+            if (IsValidImageUrl(profileImageInput)) return (profileImageInput.Trim(), null);
+
+            try
             {
-                _logger.LogWarning(
-                    "ProfilesPlugin: Rejected a profile picture for {Id} — this server allows library avatars only.",
-                    profileId);
-                return null;
+                var ext = WriteImageFiles(folder, profileId.ToString(), profileImageInput, thumbInput,
+                    $"profile {profileId}");
+                if (ext != null)
+                {
+                    // The cache-buster is what makes a changed picture appear immediately;
+                    // without it browsers keep showing the previous one at the same URL.
+                    return ($"/plugins/profiles/image/{profileId}?v={DateTime.UtcNow.Ticks}", null);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "ProfilesPlugin: Failed to save image for {Id}.", profileId);
             }
 
-            if (IsValidImageUrl(profileImageInput)) return profileImageInput.Trim();
-
-            if (profileImageInput.StartsWith("data:image/", StringComparison.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    var ext = WriteImageFiles(folder, profileId.ToString(), profileImageInput, thumbInput,
-                        $"profile {profileId}");
-                    if (ext != null)
-                    {
-                        // The cache-buster is what makes a changed picture appear immediately;
-                        // without it browsers keep showing the previous one at the same URL.
-                        return $"/plugins/profiles/image/{profileId}?v={DateTime.UtcNow.Ticks}";
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "ProfilesPlugin: Failed to save image for {Id}.", profileId);
-                }
-                return null;
-            }
-
-            // Unrecognised shape — reject rather than storing an arbitrary string that
-            // would later be rendered into an img src.
-            _logger.LogWarning(
-                "ProfilesPlugin: Rejected profile image for {Id} — not a data:image payload or a valid http(s) URL.",
-                profileId);
-            return null;
+            return (null, "That image could not be read.");
         }
 
         protected string GenerateSecureCode()

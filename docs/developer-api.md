@@ -147,12 +147,11 @@ correct attempt resets the count. A refused request returns `429`.
 | Limiter | Applies to | Attempts | Window | Counted per |
 | --- | --- | --- | --- | --- |
 | PIN | `POST /switch`, `POST /verify-pin` | 5 | 15 minutes | address and profile |
-| PIN, per profile | the same, plus the main account's PIN on edits | 10 | 15 minutes | profile, all addresses |
-| client PIN | a PIN typed into another app's sign-in | 5, and 20 a day | 15 minutes, 24 hours | account |
+| PIN, per account | every PIN check: the two routes above, the main account's PIN on edits, and a PIN typed into another app's sign-in | 5, and 20 a day | 15 minutes, 24 hours | account, all addresses and routes |
 | Bonfire | `POST /bonfire/join` | 3 | 15 minutes | address |
 | panic | `POST /panic` | 5 | 60 minutes | address |
 
-A client PIN that hits its limit gets Jellyfin's usual `Invalid username or password`. A
+A guess the 15-minute limit refused doesn't count against the day. A client PIN that hits its limit gets Jellyfin's usual `Invalid username or password`. A
 main account's real password keeps working.
 
 ## Stability
@@ -419,8 +418,10 @@ signing in on another app, Bonfire writes its policy from the main account's:
 - **Never more than the main account:** management permissions. A profile is never an
   administrator.
 
-A library granted to a profile in Dashboard → Users is kept. A library removed there comes
-back, because the profile's own list wins; edit the profile instead.
+A library granted to or removed from a profile in Dashboard → Users is kept: Bonfire
+records the list it last wrote (`LastAppliedFolders`), and a list that differs from it was
+changed by someone. A reset to "all libraries" is still repaired. A profile set to every
+library always follows its main account.
 
 If none of a profile's allowed tags is still allowed for its main account, it's given a
 placeholder tag that no item carries, so it sees nothing until it's edited.
@@ -434,7 +435,7 @@ the web client. All three are off by default.
 
 | Setting | What changes |
 | --- | --- |
-| `enableClientPinLogin` | Profiles, and main accounts with a PIN, can be signed in to with the PIN where an app asks for a password. |
+| `enableClientPinLogin` | Profiles, and main accounts with a PIN, can be signed in to with the PIN where an app asks for a password. Only on a device the household has signed in on with a password; elsewhere a main account needs its password. |
 | `enableClientProfileList` | `GET /Users/Public` includes the household of the device asking, and profiles show under their own name. |
 | `skipQuickConnectOnKnownDevices` | `POST /QuickConnect/Initiate` is refused on a TV a household has used, so the app shows its password box. |
 
@@ -446,6 +447,12 @@ unrecognised device gets Jellyfin's answer unchanged. Device limits apply.
 
 Android TV and Jellyfin for Android send a device id derived from the signed-in user. Both
 forms are recognised.
+
+With `enableClientPinLogin` on, a request with no token from a Roku a household uses also
+signs out that Roku's saved sign-ins for the household's profiles that have a PIN. The Roku
+app then asks for the PIN instead of reusing them. This happens whether or not
+`enableClientProfileList` is on. A profile whose owner skips its PIN on the home network
+keeps its saved sign-in when the request is local.
 
 ### `GET /Users/Me` and `POST /Users/AuthenticateByName`
 
@@ -662,8 +669,12 @@ device" with a `lastSeen` of `0001-01-01`.
 { "deviceId": "57bfa7e8d35f492b950bf93c9d747a11" }
 ```
 
-`400` if it's the only device a profile is allowed on, since removing it would allow every
-device. The message names those profiles.
+Forgets the device for your household and takes it off your profiles' device lists. Another
+household that uses the same device keeps it.
+
+`400` if your household has never used it. `400` if it's the only device one of your
+profiles is allowed on, since removing it would allow every device. The message names
+those profiles.
 
 ### `POST /plugins/profiles/devices/merge`
 
@@ -787,7 +798,9 @@ Bonfire, `401` not a main account, `429` too many tries.
 ```
 
 Removes the member and changes the code so they can't rejoin. Returns the new code:
-`{ "bonfireCode": "Q7M2KX" }`.
+`{ "bonfireCode": "Q7M2KX" }`. Anything the member had already opened through the Bonfire is
+signed out on that device. Leaving, deleting the Bonfire and withdrawing home-network
+switching do the same.
 
 ### `POST /plugins/profiles/bonfire/regenerate-code`
 

@@ -6,12 +6,14 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Profiles.Configuration;
 using MediaBrowser.Common.Net;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.Configuration;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Jellyfin.Profiles.Auth;
 using MediaBrowser.Controller.Devices;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Session;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Logging;
@@ -142,7 +144,10 @@ namespace Jellyfin.Profiles
             HttpContext context,
             IServerConfigurationManager serverConfig,
             IUserManager userManager,
-            IDeviceManager deviceManager)
+            IDeviceManager deviceManager,
+            ISessionManager sessionManager,
+            INetworkManager networkManager,
+            IServerApplicationHost appHost)
         {
             // Recorded before anything branches, because the one place that needs it is
             // authentication and Jellyfin hands a provider nothing about the request.
@@ -208,6 +213,16 @@ namespace Jellyfin.Profiles
                 return;
             }
 
+            // A Roku's picker is opening: whoever was using a PIN-protected profile on it has
+            // left, so that profile's saved sign-in on this set is revoked and the app asks
+            // for the PIN again. Independent of the profile list setting - a Roku lists the
+            // accounts it has saved whether or not we add any. See Auth/SavedSignInLock.cs.
+            if (IsPublicUsersRequest(context))
+            {
+                await LockSavedSignInsAsync(context, userManager, deviceManager, sessionManager, networkManager)
+                    .ConfigureAwait(false);
+            }
+
             // The login-screen user list, a completely separate job from the index document
             // below and sharing only the capture machinery. Checked first because it is a
             // different path entirely and must not fall through the index logic.
@@ -217,7 +232,7 @@ namespace Jellyfin.Profiles
                 return;
             }
 
-            if (!ShouldHandle(context, serverConfig))
+            if (!ShouldHandle(context, serverConfig, appHost))
             {
                 await _next(context).ConfigureAwait(false);
                 return;
@@ -284,7 +299,8 @@ namespace Jellyfin.Profiles
 
             if (context.Response.HasStarted)
             {
-                // Something wrote past the capture. Nothing safe left to do.
+                await DeliverStartedAsync(context, produced, "index.html", "the script could not be added")
+                    .ConfigureAwait(false);
                 return;
             }
 
@@ -295,6 +311,7 @@ namespace Jellyfin.Profiles
             }
 
             string html;
+            var baseUrl = ReadBaseUrl(serverConfig);
             try
             {
                 var document = Encoding.UTF8.GetString(produced);
@@ -302,13 +319,13 @@ namespace Jellyfin.Profiles
                 // Already there — the file is patched on disk in "both" mode, or something
                 // else in the pipeline added the same tags. A second copy would give the
                 // browser two scripts and two gates.
-                if (WebInjection.IsFullyInjected(document))
+                if (WebInjection.IsFullyInjectedAt(document, baseUrl))
                 {
                     await PassThroughAsync(context, produced).ConfigureAwait(false);
                     return;
                 }
 
-                if (!WebInjection.Inject(document, out html))
+                if (!WebInjection.InjectAt(document, baseUrl, out html))
                 {
                     // Neither anchor found and nothing already present, so this is not a
                     // document we understand. Hand back whatever the pipeline made.
@@ -426,28 +443,10 @@ namespace Jellyfin.Profiles
 
             if (context.Response.HasStarted)
             {
-                // Something sent the headers while the capture was in place, so the body went
-                // into our buffer and not to the client. Returning here left the television
-                // with a 200 and an empty list. The household cannot be added any more - the
-                // headers, Content-Length included, are gone - but Jellyfin's own answer can
-                // still be delivered, and the log says why the profiles are missing.
-                _logger.LogWarning(
-                    "ProfilesPlugin: the user list response had already started when it came back to us, "
-                    + "so no profiles could be added to it (status {Status}, {Bytes} byte(s) passed on).",
-                    context.Response.StatusCode, produced.Length);
-
-                if (produced.Length > 0)
-                {
-                    try
-                    {
-                        await context.Response.Body.WriteAsync(produced, context.RequestAborted).ConfigureAwait(false);
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        _logger.LogWarning(ex, "ProfilesPlugin: could not pass the started user list response on.");
-                    }
-                }
-
+                // Returning here left the television with a 200 and an empty list. See
+                // DeliverStartedAsync.
+                await DeliverStartedAsync(context, produced, "user list", "no profiles could be added to it")
+                    .ConfigureAwait(false);
                 return;
             }
 
@@ -508,27 +507,71 @@ namespace Jellyfin.Profiles
         /// path so no other Users route is ever buffered.
         /// </summary>
         private static bool IsPublicUsersPath(HttpContext context)
+            => Plugin.Instance?.Configuration?.EnableClientProfileList == true
+               && IsPublicUsersRequest(context);
+
+        /// <summary>
+        /// <c>GET /Users/Public</c>, whatever the settings say. The emergency disable reaches
+        /// this too; see IsOwnUserPath.
+        /// </summary>
+        private static bool IsPublicUsersRequest(HttpContext context)
         {
-            // Emergency disable reaches this too. See IsOwnUserPath.
             if (Plugin.IsPanicDisabled) return false;
-
-            if (!HttpMethods.IsGet(context.Request.Method))
-            {
-                return false;
-            }
-
-            if (Plugin.Instance?.Configuration?.EnableClientProfileList != true)
-            {
-                return false;
-            }
+            if (!HttpMethods.IsGet(context.Request.Method)) return false;
 
             var path = context.Request.Path.Value;
-            if (string.IsNullOrEmpty(path))
+            return !string.IsNullOrEmpty(path)
+                && path.EndsWith("/Users/Public", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Hands a sign-in screen's request to <see cref="SavedSignInLock"/>. Cheap when it
+        /// has nothing to do: one setting read, one header parse and an in-memory lookup.
+        /// </summary>
+        private async Task LockSavedSignInsAsync(
+            HttpContext context,
+            IUserManager userManager,
+            IDeviceManager deviceManager,
+            ISessionManager sessionManager,
+            INetworkManager networkManager)
+        {
+            var config = Controllers.ProfilesBaseController.ReadConfigSnapshot();
+            if (config?.EnableClientPinLogin != true) return;
+
+            var auth = context.Request.Headers[HeaderNames.Authorization];
+            var emby = context.Request.Headers["X-Emby-Authorization"];
+
+            // Every way Jellyfin accepts a token. Any of them means somebody is signed in on
+            // this client, and their session is not ours to end.
+            var carriesToken =
+                !string.IsNullOrEmpty(Controllers.ProfilesBaseController.ParseAuthorizationParameter(auth, emby, "Token"))
+                || !StringValues.IsNullOrEmpty(context.Request.Headers["X-Emby-Token"])
+                || !StringValues.IsNullOrEmpty(context.Request.Headers["X-MediaBrowser-Token"])
+                || context.Request.Query.ContainsKey("api_key")
+                || context.Request.Query.ContainsKey("ApiKey");
+
+            // Unknown counts as not local: the cost of being wrong is one more PIN.
+            bool isLocal;
+            try
             {
-                return false;
+                var remoteIp = context.Connection.RemoteIpAddress;
+                isLocal = remoteIp != null && networkManager != null && networkManager.IsInLocalNetwork(remoteIp);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "ProfilesPlugin: could not tell whether a sign-in screen is on the local network.");
+                isLocal = false;
             }
 
-            return path.EndsWith("/Users/Public", StringComparison.OrdinalIgnoreCase);
+            await SavedSignInLock.LockAsync(
+                Controllers.ProfilesBaseController.ParseAuthorizationParameter(auth, emby, "DeviceId"),
+                carriesToken,
+                isLocal,
+                config,
+                deviceManager,
+                sessionManager,
+                userManager,
+                _logger).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -619,7 +662,12 @@ namespace Jellyfin.Profiles
                 produced = captured.ToArray();
             }
 
-            if (context.Response.HasStarted) return;
+            if (context.Response.HasStarted)
+            {
+                await DeliverStartedAsync(context, produced, "own user record", "the profile could not be renamed in it")
+                    .ConfigureAwait(false);
+                return;
+            }
 
             byte[]? rewritten = null;
             if (context.Response.StatusCode == StatusCodes.Status200OK
@@ -700,6 +748,36 @@ namespace Jellyfin.Profiles
                    && contentType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase);
         }
 
+        /// <summary>
+        /// The response had already started when it came back to us. Something downstream
+        /// sent the headers while the capture was in place, so the body went into our buffer
+        /// and not to the client; returning then gave the client a 200 with nothing in it.
+        /// Whatever we meant to change cannot be changed any more - the headers, Content-Length
+        /// included, are gone - but Jellyfin's own answer can still be delivered, and the log
+        /// says why it was not edited. Every capture path ends here when that happens.
+        /// </summary>
+        private async Task DeliverStartedAsync(HttpContext context, byte[] produced, string what, string consequence)
+        {
+            _logger.LogWarning(
+                "ProfilesPlugin: the {What} response had already started when it came back to us, "
+                + "so {Consequence} (status {Status}, {Bytes} byte(s) passed on).",
+                what, consequence, context.Response.StatusCode, produced.Length);
+
+            if (produced.Length == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                await context.Response.Body.WriteAsync(produced, context.RequestAborted).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "ProfilesPlugin: could not pass the started {What} response on.", what);
+            }
+        }
+
         /// <summary>Writes back exactly what the pipeline produced, untouched.</summary>
         private static async Task PassThroughAsync(HttpContext context, byte[] produced)
         {
@@ -740,7 +818,10 @@ namespace Jellyfin.Profiles
         /// True when this request is for the web client's index.html and we are allowed to
         /// answer it.
         /// </summary>
-        private static bool ShouldHandle(HttpContext context, IServerConfigurationManager serverConfig)
+        private static bool ShouldHandle(
+            HttpContext context,
+            IServerConfigurationManager serverConfig,
+            IServerApplicationHost? appHost)
         {
             if (!HttpMethods.IsGet(context.Request.Method))
             {
@@ -760,9 +841,15 @@ namespace Jellyfin.Profiles
             {
                 var network = serverConfig.GetNetworkConfiguration();
 
-                // If HTTPS is mandatory, a plain HTTP request is supposed to be redirected.
-                // We run ahead of that redirect, so step aside rather than answering it.
-                if (network.RequireHttps && !context.Request.IsHttps)
+                // Step aside only when Jellyfin itself will redirect this request. Its
+                // redirect is in the pipeline only when RequireHttps is set AND it is
+                // listening with HTTPS (Jellyfin.Server Startup.cs: config.RequireHttps &&
+                // ListenWithHttps). RequireHttps alone is not enough: we run before
+                // forwarded headers are applied, so behind a TLS-terminating proxy IsHttps
+                // is false on every request, and stepping aside then meant nothing was
+                // ever injected. Answering a request that is about to be redirected would
+                // only serve a page the browser is told to leave.
+                if (network.RequireHttps && !context.Request.IsHttps && ListensWithHttps(appHost))
                 {
                     return false;
                 }
@@ -778,6 +865,38 @@ namespace Jellyfin.Profiles
             // We sit ahead of Jellyfin's UsePathBase, so a server published under a base URL
             // still shows it here. Accept both forms rather than depending on that ordering.
             return IsIndexPath(path, baseUrl) || IsIndexPath(path, null);
+        }
+
+        /// <summary>Whether Jellyfin is listening with HTTPS, false when that cannot be read.</summary>
+        private static bool ListensWithHttps(IServerApplicationHost? appHost)
+        {
+            try
+            {
+                return appHost != null && appHost.ListenWithHttps;
+            }
+            catch (Exception)
+            {
+                // Unknown is "not redirecting": the cost of being wrong is one answered
+                // request that Jellyfin would have redirected, not a server with no switcher.
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// The Base URL Jellyfin is published under, read the way Jellyfin does it
+        /// (<c>GetNetworkConfiguration().BaseUrl</c>), or empty when there is none or it
+        /// cannot be read.
+        /// </summary>
+        private static string ReadBaseUrl(IServerConfigurationManager serverConfig)
+        {
+            try
+            {
+                return WebInjection.NormalizeBaseUrl(serverConfig.GetNetworkConfiguration().BaseUrl);
+            }
+            catch (Exception)
+            {
+                return string.Empty;
+            }
         }
 
         private static bool IsIndexPath(string path, string? baseUrl)
