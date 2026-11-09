@@ -5,7 +5,7 @@
          must itself run on: a net9 harness cannot load the net10 assembly. Defaults to
          net9.0, the one that ships. tests/run.sh cs10 runs the whole set against the
          other one. -->
-    <BonfireTfm Condition="'$(BonfireTfm)' == ''">net9.0</BonfireTfm>
+    <BonfireTfm Condition="'$(BonfireTfm)' == ''">net10.0</BonfireTfm>
     <TargetFramework>$(BonfireTfm)</TargetFramework>
     <Nullable>disable</Nullable>
     <AssemblyName>matrix</AssemblyName>

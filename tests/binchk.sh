@@ -16,10 +16,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 VERSIONS=("$@")
-[ ${#VERSIONS[@]} -eq 0 ] && VERSIONS=(10.11.11 12.0.0)
-PLUGIN="${PLUGIN:-bin/Release/net9.0/Jellyfin.Profiles.dll}"
+[ ${#VERSIONS[@]} -eq 0 ] && VERSIONS=(12.4.0)   # lsheardo-12.4: the server this branch is built for
+# lsheardo-12.4: this branch builds net10.0 only. A caller-supplied PLUGIN is used as-is
+# and not rebuilt.
+PLUGIN_GIVEN="${PLUGIN:-}"
+PLUGIN="${PLUGIN:-bin/Release/net10.0/Jellyfin.Profiles.dll}"
 
-if [ -z "${SKIP_BUILD:-}" ] && [ -z "${PLUGIN_GIVEN:-}" ]; then
+if [ -z "${SKIP_BUILD:-}" ] && [ -z "$PLUGIN_GIVEN" ]; then
     dotnet build -c Release --nologo -v q >/dev/null || { echo "build FAILED"; exit 1; }
 fi
 
