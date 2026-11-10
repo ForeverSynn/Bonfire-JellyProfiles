@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Devices;
 using System.Collections.Generic;
@@ -43,6 +44,9 @@ var networkConfig = new NetworkConfiguration();
 var serverConfig = DispatchProxy.Create<IServerConfigurationManager, ThrowingProxy>();
 var userManager = DispatchProxy.Create<IUserManager, ThrowingProxy>();
 var deviceManager = DispatchProxy.Create<IDeviceManager, ThrowingProxy>();
+var sessionManager = DispatchProxy.Create<MediaBrowser.Controller.Session.ISessionManager, ThrowingProxy>();
+var networkManager = DispatchProxy.Create<MediaBrowser.Common.Net.INetworkManager, ThrowingProxy>();
+var appHost = DispatchProxy.Create<MediaBrowser.Controller.IServerApplicationHost, AppHostProxy>();
 ((ThrowingProxy)(object)serverConfig).AnswerTo = "GetConfiguration";
 ((ThrowingProxy)(object)serverConfig).Answer = networkConfig;
 
@@ -91,7 +95,20 @@ async Task<Result> Run(string path, RequestDelegate downstream, Action<HttpConte
     // The user-list injection takes these; the index path this file exercises never
     // touches them, and both proxies throw on any call — so if that ever stops being true,
     // these tests say so loudly instead of quietly exercising a different path.
-    await middleware.Invoke(context, serverConfig, userManager, deviceManager);
+    //
+    // Arguments are matched to Invoke's parameters by type, so the harness builds against
+    // an older middleware (which does not take IServerApplicationHost) as well as this one.
+    var invokeArgs = typeof(ProfilesIndexMiddleware).GetMethod("Invoke").GetParameters()
+        .Select(p => p.ParameterType == typeof(HttpContext) ? (object)context
+            : p.ParameterType == typeof(IServerConfigurationManager) ? serverConfig
+            : p.ParameterType == typeof(IUserManager) ? userManager
+            : p.ParameterType == typeof(IDeviceManager) ? deviceManager
+            : p.ParameterType == typeof(MediaBrowser.Controller.Session.ISessionManager) ? sessionManager
+            : p.ParameterType == typeof(MediaBrowser.Common.Net.INetworkManager) ? networkManager
+            : p.ParameterType == typeof(MediaBrowser.Controller.IServerApplicationHost) ? appHost
+            : throw new InvalidOperationException("Invoke takes " + p.ParameterType.Name))
+        .ToArray();
+    await (Task)typeof(ProfilesIndexMiddleware).GetMethod("Invoke").Invoke(middleware, invokeArgs);
 
     return new Result
     {
@@ -407,6 +424,113 @@ var served = (long)servedProp.GetValue(null);
 // — the dashboard reports this number as "pages served".
 Check("served count is one per document actually rewritten (got " + served + ")", served == 6);
 
+Console.WriteLine();
+Console.WriteLine("── A Base URL (R-1093) ─────────────────────────────────────────");
+
+// Jellyfin's BaseUrlRedirectionMiddleware sends any path without the base to <base>/web/,
+// so a script tag that names /plugins/profiles/profiles.js is answered with HTML.
+networkConfig.BaseUrl = "/jf";
+var based = await Run("/jf/web/index.html", WriteBody(PlainIndex));
+Check("under /jf the script tag is prefixed with it",
+    based.Body.Contains("src=\"/jf/plugins/profiles/profiles.js?v="));
+Check("and no unprefixed tag is left beside it",
+    Count(based.Body, "/plugins/profiles/profiles.js") == 1);
+
+// A file patched on disk before the Base URL was set carries the bare path. That is not
+// "already injected": it has to be corrected, not passed through.
+var bare = PlainIndex.Replace("</body>",
+    "<script src=\"/plugins/profiles/profiles.js?v=" + ScriptVersionNow() + "\" defer></script></body>");
+var fixedUp = await Run("/jf/web/", WriteBody(bare));
+Check("an unprefixed tag already in the document is corrected",
+    fixedUp.Body.Contains("src=\"/jf/plugins/profiles/profiles.js?v=")
+    && Count(fixedUp.Body, "/plugins/profiles/profiles.js") == 1);
+
+networkConfig.BaseUrl = "/jf/";
+var slash = await Run("/jf/web/", WriteBody(PlainIndex));
+Check("a trailing slash on the setting does not double up",
+    slash.Body.Contains("src=\"/jf/plugins/profiles/profiles.js?v="));
+
+networkConfig.BaseUrl = "";
+var none = await Run("/web/", WriteBody(PlainIndex));
+Check("with no Base URL the tag is the bare path, as before",
+    none.Body.Contains("src=\"/plugins/profiles/profiles.js?v="));
+
+static string ScriptVersionNow() =>
+    (string)typeof(ProfilesIndexMiddleware).Assembly
+        .GetType("Jellyfin.Profiles.WebInjection", true)
+        .GetProperty("ScriptVersion", System.Reflection.BindingFlags.Static
+            | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public)
+        .GetValue(null);
+
+Console.WriteLine();
+Console.WriteLine("── HTTPS required (R-1094) ─────────────────────────────────────");
+
+// Jellyfin redirects to HTTPS only when RequireHttps is set AND it is itself listening with
+// HTTPS (Startup.cs: config.RequireHttps && ListenWithHttps). This middleware runs before
+// forwarded headers are applied, so behind a TLS-terminating proxy IsHttps is false on
+// every request; stepping aside on RequireHttps alone meant nothing was ever injected.
+networkConfig.BaseUrl = "";
+networkConfig.RequireHttps = true;
+
+AppHostProxy.ListenWithHttps = false;
+var proxied = await Run("/web/index.html", WriteBody(PlainIndex));
+Check("behind a proxy (RequireHttps, Jellyfin not listening on HTTPS) the page is injected",
+    proxied.Body.Contains("/plugins/profiles/profiles.js"));
+
+AppHostProxy.ListenWithHttps = true;
+var wouldRedirect = await Run("/web/index.html", WriteBody(PlainIndex));
+Check("when Jellyfin will redirect the plain request, we step aside",
+    !wouldRedirect.Body.Contains("/plugins/profiles/profiles.js") && wouldRedirect.Seen.Called);
+
+var secure = await Run("/web/index.html", WriteBody(PlainIndex), c => c.Request.Scheme = "https");
+Check("an HTTPS request is injected whatever the setting",
+    secure.Body.Contains("/plugins/profiles/profiles.js"));
+
+AppHostProxy.ListenWithHttps = false;
+networkConfig.RequireHttps = false;
+
+Console.WriteLine();
+Console.WriteLine("── Jellyfin's body when the response has already started (R-1095) ──");
+
+// A downstream that has sent its headers. The body it wrote went into our buffer, so
+// returning without writing it back gave the client a 200 with nothing in it.
+RequestDelegate Started(string content, string type) => async ctx =>
+{
+    var bytes = Encoding.UTF8.GetBytes(content);
+    ctx.Response.StatusCode = 200;
+    ctx.Response.ContentType = type;
+    await ctx.Response.Body.WriteAsync(bytes);
+    ((StartableResponse)ctx.Features.Get<IHttpResponseFeature>()).Started = true;
+};
+
+async Task<string> RunPrivate(string method, string path, string verb, RequestDelegate downstream)
+{
+    var context = new DefaultHttpContext();
+    context.Request.Method = verb;
+    context.Request.Path = path;
+    context.Features.Set<IHttpResponseFeature>(new StartableResponse());
+    var body = new MemoryStream();
+    context.Features.Set<IHttpResponseBodyFeature>(new StreamResponseBodyFeature(body));
+    var mw = new ProfilesIndexMiddleware(downstream, NullLogger<ProfilesIndexMiddleware>.Instance);
+    var m = typeof(ProfilesIndexMiddleware).GetMethod(method, System.Reflection.BindingFlags.Instance
+        | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+    if (m == null) throw new InvalidOperationException(method + " is gone");
+    await (Task)m.Invoke(mw, method == "Invoke"
+        ? new object[] { context, serverConfig, userManager, deviceManager, sessionManager, networkManager }
+        : new object[] { context });
+    return Encoding.UTF8.GetString(body.ToArray());
+}
+
+var started = await Run("/web/index.html", Started(PlainIndex, "text/html"),
+    c => c.Features.Set<IHttpResponseFeature>(new StartableResponse()));
+Check("the index: Jellyfin's document reaches the client", started.Body == PlainIndex);
+
+const string UserJson = "{\"Name\":\"Mum\",\"Id\":\"11111111111111111111111111111111\"}";
+Check("/Users/Me: Jellyfin's body reaches the client",
+    await RunPrivate("RewriteOwnNameAsync", "/Users/Me", "GET", Started(UserJson, "application/json")) == UserJson);
+Check("AuthenticateByName: Jellyfin's body reaches the client",
+    await RunPrivate("RewriteOwnNameAsync", "/Users/AuthenticateByName", "POST", Started(UserJson, "application/json")) == UserJson);
+
 try { Directory.Delete(tempDir, true); } catch { /* best effort */ }
 
 Console.WriteLine();
@@ -446,6 +570,27 @@ sealed class Result
 // has no interest in any of them. A proxy answers the one call the middleware actually
 // makes and throws on everything else. The middleware no longer takes IApplicationPaths
 // at all, which is the strongest possible form of "it does not read index.html off disk".
+// IServerApplicationHost, answering only ListenWithHttps: true when Jellyfin has a
+// certificate and HTTPS enabled, which is the only time its HTTPS redirect is in the pipeline.
+public class AppHostProxy : DispatchProxy
+{
+    public static bool ListenWithHttps;
+
+    protected override object Invoke(MethodInfo targetMethod, object[] args)
+    {
+        if (targetMethod.Name == "get_ListenWithHttps") return ListenWithHttps;
+        throw new NotImplementedException(targetMethod.Name + " should not be reached");
+    }
+}
+
+// A response whose headers have gone out, as when something downstream calls StartAsync or
+// flushes. DefaultHttpContext never reports HasStarted on its own.
+public class StartableResponse : Microsoft.AspNetCore.Http.Features.HttpResponseFeature
+{
+    public bool Started;
+    public override bool HasStarted => Started;
+}
+
 public class ThrowingProxy : DispatchProxy
 {
     public object Answer;

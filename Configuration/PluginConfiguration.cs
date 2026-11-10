@@ -12,6 +12,9 @@ namespace Jellyfin.Profiles.Configuration
         public List<ProfileMapping> Mappings { get; set; } = new List<ProfileMapping>();
         public List<KnownDevice> KnownDevices { get; set; } = new List<KnownDevice>();
         public List<BonfireGroup> BonfireGroups { get; set; } = new List<BonfireGroup>();
+
+        /// <summary>Devices signed into another household's account. See <see cref="CrossHouseholdEntry"/>.</summary>
+        public List<CrossHouseholdEntry> CrossHouseholdEntries { get; set; } = new List<CrossHouseholdEntry>();
         public List<UserProfileLimitOverride> UserProfileLimitOverrides { get; set; } = new List<UserProfileLimitOverride>();
         // AuditLogs have been moved to a separate audit_log.json file so they no longer
         // cause a full PluginConfiguration.xml rewrite on every profile switch.
@@ -46,6 +49,7 @@ namespace Jellyfin.Profiles.Configuration
             copy.Mappings = Mappings?.Select(m => m.CopyForReading()).ToList() ?? new List<ProfileMapping>();
             copy.KnownDevices = KnownDevices?.ToList() ?? new List<KnownDevice>();
             copy.BonfireGroups = BonfireGroups?.ToList() ?? new List<BonfireGroup>();
+            copy.CrossHouseholdEntries = CrossHouseholdEntries?.Select(e => e.Copy()).ToList() ?? new List<CrossHouseholdEntry>();
             copy.UserProfileLimitOverrides = UserProfileLimitOverrides?.ToList() ?? new List<UserProfileLimitOverride>();
             copy.AvatarLibrary = AvatarLibrary?.ToList() ?? new List<AvatarLibraryItem>();
             copy.QuickConnectSharedDeviceNames = QuickConnectSharedDeviceNames?.ToList() ?? new List<string>();
@@ -212,6 +216,27 @@ namespace Jellyfin.Profiles.Configuration
         /// </para>
         /// </summary>
         public Guid MasterUserId { get; set; }
+
+        /// <summary>
+        /// Every household that has signed in on this device, <see cref="MasterUserId"/>
+        /// (the one seen last) among them (R-1050).
+        /// <para>
+        /// One owner per id did not fit a browser or a Roku that two households share: the
+        /// first to sign in kept it for good, so the second could not restrict a profile to
+        /// it, and its PINs were refused there once a PIN needed a household device
+        /// (R-1344). Ownership is what grants things; <see cref="MasterUserId"/> only
+        /// decides whose profiles a sign-in screen shows, since nobody is signed in to ask.
+        /// </para>
+        /// <para>
+        /// Replaced, never edited in place: a configuration snapshot shares these objects
+        /// and reads them without the lock.
+        /// </para>
+        /// </summary>
+        public List<Guid> Owners { get; set; } = new List<Guid>();
+
+        /// <summary>True if <paramref name="householdId"/> has signed in on this device.</summary>
+        public bool OwnedBy(Guid householdId)
+            => householdId != Guid.Empty && (MasterUserId == householdId || (Owners?.Contains(householdId) ?? false));
 
         /// <summary>
         /// True once an administrator has renamed this device by hand, which stops the name
@@ -637,6 +662,15 @@ namespace Jellyfin.Profiles.Configuration
         /// </summary>
         public ProfileLimits? LastAppliedLimits { get; set; }
 
+        /// <summary>
+        /// The library list Bonfire last wrote to the profile's account, so a change made on
+        /// the account in Dashboard -> Users can be told apart from Bonfire's own write and
+        /// from a reset (R-1042). Null on a configuration from before this existed: the first
+        /// sign-in then behaves as it always did and records it. See
+        /// <see cref="Auth.LibraryAccessReconciler.ReconcileWithLastApplied"/>.
+        /// </summary>
+        public List<Guid>? LastAppliedFolders { get; set; }
+
         /// <summary>A copy for <see cref="PluginConfiguration.SnapshotForReading"/>.</summary>
         public ProfileMapping CopyForReading()
         {
@@ -645,6 +679,7 @@ namespace Jellyfin.Profiles.Configuration
             copy.LastAppliedLimits = LastAppliedLimits?.Copy();
             copy.AllowedDeviceIds = AllowedDeviceIds?.ToList() ?? new List<string>();
             copy.EnabledFolders = EnabledFolders?.ToList();
+            copy.LastAppliedFolders = LastAppliedFolders?.ToList();
             copy.BlockedTags = BlockedTags?.ToList();
             copy.AllowedTags = AllowedTags?.ToList();
             copy.LibraryArtwork = LibraryArtwork?.ToList() ?? new List<LibraryArtwork>();

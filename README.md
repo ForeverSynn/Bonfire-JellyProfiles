@@ -26,6 +26,8 @@ Works with Jellyfin 10.11 and 12.0.
   the default and can turn choosing off.
 - **Your choice of switcher.** A Bonfire button in the header or a **Switch Profile**
   entry in Jellyfin's own menu, with an optional "Who's watching?" screen on startup.
+- **Six languages.** English, Catalan, French, Polish, Spanish and Turkish, following the
+  language set in Jellyfin. [Add yours](Web/i18n/README.md).
 
 ![The create-profile form](images/create-profile.png)
 
@@ -44,13 +46,13 @@ Nothing else to set up. If the switcher doesn't appear, see
 
 ## Apps
 
-**Full support:** Jellyfin Web, Jellyfin for Android, Jellyfin Media Player, LG webOS
-4.5 and later, and Samsung Tizen
+**Full support:** Jellyfin Web, Jellyfin for Android, Jellyfin for iOS (iPhone and iPad),
+Jellyfin Media Player, LG webOS 4.5 and later, and Samsung Tizen
 ([one-time setup](docs/troubleshooting.md#samsung-tizen)).
 
 **Profile sign-in:** Jellyfin for Android TV, Roku, Swiftfin, Findroid and Wholphin can
 list your profiles on their own sign-in screen. Turn it on under
-**Dashboard → Bonfire → TVs & Apps**, and turn off automatic sign-in in the app. Type
+**Dashboard → Bonfire → TVs & Apps**, and [set the app to ask every time](docs/clients.md#profile-sign-in). Type
 the profile's PIN where the app asks for a password. Android TV is confirmed on hardware;
 the others are not yet.
 

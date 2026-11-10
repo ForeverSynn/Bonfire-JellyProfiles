@@ -378,6 +378,14 @@ namespace Jellyfin.Profiles.Controllers
                 return BadRequest(allowedTagsError);
             }
 
+            // A picture that would be refused is refused now, before the account exists,
+            // rather than after it: it used to be dropped silently and the profile made
+            // without one (R-1108).
+            var pictureError = !string.IsNullOrEmpty(request.AvatarLibraryId)
+                ? CheckLibraryAvatar(request.AvatarLibraryId)
+                : CheckProfileImage(Guid.Empty, request.ProfileImage, null);
+            if (pictureError != null) return BadRequest(pictureError);
+
             // Standardize username to avoid global collisions
             string systemUsername = $"{masterUser.Username}_{profileName.Replace(" ", "")}";
 
@@ -493,13 +501,16 @@ namespace Jellyfin.Profiles.Controllers
                     EnabledFolders = validatedFolders,
                     // Nothing ticked means every library the master has, then and later.
                     AllLibraries = request.EnabledFolders == null,
+                    // What was just written to the account, when it was a list. Without it the
+                    // next sign-in would read this write as an administrator's change (R-1042).
+                    LastAppliedFolders = request.EnabledFolders != null ? validatedFolders.ToList() : null,
                     BlockedTags = profileBlockedTags,
                     AllowedTags = profileAllowedTags,
                     BypassPinOnLocalNetwork = request.BypassPinOnLocalNetwork ?? false,
                     AllowedDeviceIds = request.AllowedDeviceIds ?? new List<string>(),
                     ProfileImage = !string.IsNullOrEmpty(request.AvatarLibraryId)
-                        ? CopyLibraryAvatarToProfile(targetUser.Id, request.AvatarLibraryId)
-                        : SaveProfileImage(targetUser.Id, request.ProfileImage, request.ProfileImageThumb)
+                        ? CopyLibraryAvatarToProfile(targetUser.Id, request.AvatarLibraryId).Url
+                        : SaveProfileImage(targetUser.Id, request.ProfileImage, request.ProfileImageThumb).Url
                 });
 
                 Plugin.Instance?.SaveConfiguration();
@@ -754,6 +765,7 @@ namespace Jellyfin.Profiles.Controllers
 
             // Verify PIN if set
             var pinHashToCheck = mapping?.PinHash;
+            bool pinVerified = false;
             if (!string.IsNullOrEmpty(pinHashToCheck))
             {
                 bool bypass = CanSkipPin(mapping, isLocal, isCrossAccountMasterSwitch, householdLanBypass);
@@ -783,10 +795,11 @@ namespace Jellyfin.Profiles.Controllers
                     {
                         return BadRequest("Invalid PIN code.");
                     }
+                    pinVerified = true;
                 }
             }
 
-            EndPinAttempt(rateLimitKey, request.ProfileId);
+            EndPinAttempt(rateLimitKey, request.ProfileId, pinVerified);
             tAuth = sw.ElapsedMilliseconds;
 
             var targetUser = _userManager.GetUserById(request.ProfileId);
@@ -803,6 +816,16 @@ namespace Jellyfin.Profiles.Controllers
                     "ProfilesPlugin: refused a switch into {ProfileId}, whose account is disabled.",
                     request.ProfileId);
                 return BadRequest("This profile's account is turned off on the server.");
+            }
+
+            // Nor does turning off the main account: a profile's own account is never the one
+            // that was turned off, so its profiles stayed enterable (R-1135).
+            if (MainAccountDisabled(_userManager, mapping))
+            {
+                _logger.LogWarning(
+                    "ProfilesPlugin: refused a switch into {ProfileId}, whose main account is disabled.",
+                    request.ProfileId);
+                return BadRequest("This profile's main account is turned off on the server.");
             }
 
             // Inherit/synchronize streaming policies and configurations from master user dynamically during switch
@@ -841,6 +864,20 @@ namespace Jellyfin.Profiles.Controllers
             };
             tPolicy = sw.ElapsedMilliseconds;
 
+            // The profile's earlier sessions on this same device go first. Jellyfin counts
+            // them against MaxActiveSessions before it replaces any, so they made the switch
+            // fail and the page reload into the picker in a loop (issue #41).
+            // Best effort: if this fails, the switch goes ahead as it did before.
+            try
+            {
+                await Auth.SameDeviceSessions.EndAsync(_sessionManager, _deviceManager, ReadConfigSnapshot(),
+                    targetUser.Id, authRequest.DeviceId, _logger).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "ProfilesPlugin: could not end {User}'s earlier sessions on this device.", targetUser.Username);
+            }
+
             // Authenticate directly bypassing password check (securely validated caller + PIN validation)
             // Never let this throw past us: Jellyfin's exception middleware turns these into a 401,
             // and the client reads a 401 as "the caller's session expired" and signs the master out.
@@ -849,7 +886,7 @@ namespace Jellyfin.Profiles.Controllers
             {
                 session = await _sessionManager.AuthenticateDirect(authRequest).ConfigureAwait(false);
             }
-            catch (System.Security.SecurityException ex)
+            catch (MediaBrowser.Controller.Net.SecurityException ex)
             {
                 _logger.LogWarning(ex, "ProfilesPlugin: Session creation refused for {User}.", targetUser.Username);
                 var reason = ex.Message.Contains("device", StringComparison.OrdinalIgnoreCase)
@@ -864,6 +901,19 @@ namespace Jellyfin.Profiles.Controllers
             }
 
             tSession = sw.ElapsedMilliseconds;
+
+            // Into another household: remembered, so taking the door away later can sign
+            // this device out of it (R-1302). See CrossHouseholdEntry.
+            if (isCrossAccountMasterSwitch)
+            {
+                lock (ConfigLock)
+                {
+                    var live = Plugin.Instance?.Configuration;
+                    var withoutPin = !string.IsNullOrEmpty(pinHashToCheck) && householdLanBypass;
+                    if (live != null && CrossHouseholdEntries.Record(live, callerMasterUserId, targetUser.Id, authRequest.DeviceId, withoutPin, DateTime.UtcNow))
+                        Plugin.Instance?.SaveConfiguration();
+                }
+            }
 
             // Record profile switch audit log
             RecordAuditLog(masterUser?.Username ?? "Unknown", targetUser.Username);
@@ -948,6 +998,7 @@ namespace Jellyfin.Profiles.Controllers
             }
 
             var target = rules.Target;
+            bool pinVerified = false;
             if (target != null && !string.IsNullOrEmpty(target.PinHash)
                 && !CanSkipPin(target, isLocal, rules.CrossHousehold, rules.HouseholdLanBypass))
             {
@@ -958,9 +1009,10 @@ namespace Jellyfin.Profiles.Controllers
                 {
                     return BadRequest("Invalid PIN.");
                 }
+                pinVerified = true;
             }
 
-            EndPinAttempt(rateLimitKey, request.ProfileId);
+            EndPinAttempt(rateLimitKey, request.ProfileId, pinVerified);
             return Ok();
         }
 
@@ -1657,7 +1709,10 @@ namespace Jellyfin.Profiles.Controllers
                 ? NormalizeTags(request.AllowedTags)
                 : existingMapping?.AllowedTags;
 
-            // Renaming logic
+            // A rename that would clash is refused before anything is written, the picture
+            // included: checking it after the picture was saved answered 400 with the new
+            // picture already on disk.
+            string? renameTo = null;
             if (request.ProfileId != masterUserId)
             {
                 string systemUsername = $"{masterUser.Username}_{request.ProfileName.Trim().Replace(" ", "")}";
@@ -1668,9 +1723,37 @@ namespace Jellyfin.Profiles.Controllers
                     {
                         return BadRequest("A profile with this name already exists.");
                     }
-                    targetUser.Username = systemUsername;
-                    await _userManager.UpdateUserAsync(targetUser).ConfigureAwait(false);
+                    renameTo = systemUsername;
                 }
+            }
+
+            // The picture first, before anything else is written. A refused one answers 400
+            // with the reason and leaves the profile exactly as it was: the picture it has,
+            // its name and everything else in this request. A rejected picture used to be
+            // stored as "none", so a 3 MB upload deleted the existing one and answered 200
+            // (R-1108).
+            string? newImageUrl = null;
+            var imageChanged = false;
+            if (!string.IsNullOrEmpty(request.AvatarLibraryId))
+            {
+                var copied = CopyLibraryAvatarToProfile(request.ProfileId, request.AvatarLibraryId);
+                if (copied.Error != null) return BadRequest(copied.Error);
+                newImageUrl = copied.Url;
+                imageChanged = true;
+            }
+            else if (request.ProfileImage != null)
+            {
+                var saved = SaveProfileImage(request.ProfileId, request.ProfileImage, request.ProfileImageThumb, existingMapping?.ProfileImage);
+                if (saved.Error != null) return BadRequest(saved.Error);
+                newImageUrl = saved.Url;
+                imageChanged = true;
+            }
+
+            // Renaming logic (the clash was checked above, before the picture)
+            if (renameTo != null)
+            {
+                targetUser.Username = renameTo;
+                await _userManager.UpdateUserAsync(targetUser).ConfigureAwait(false);
             }
 
             // Update policy for sub-profiles
@@ -1778,13 +1861,9 @@ namespace Jellyfin.Profiles.Controllers
                         mappingEntry.Theme = ThemeToStore(request.Theme);
                     }
 
-                    if (!string.IsNullOrEmpty(request.AvatarLibraryId))
+                    if (imageChanged)
                     {
-                        mappingEntry.ProfileImage = CopyLibraryAvatarToProfile(request.ProfileId, request.AvatarLibraryId);
-                    }
-                    else if (request.ProfileImage != null)
-                    {
-                        mappingEntry.ProfileImage = SaveProfileImage(request.ProfileId, request.ProfileImage, request.ProfileImageThumb);
+                        mappingEntry.ProfileImage = newImageUrl;
                     }
 
                     // Handle PIN updates
@@ -1809,6 +1888,11 @@ namespace Jellyfin.Profiles.Controllers
                         mappingEntry.EnabledFolders = validatedFolders;
                         // Nothing ticked means every library the master has, then and later.
                         mappingEntry.AllLibraries = request.EnabledFolders == null;
+                        // What was just written to the account, so the next sign-in does not
+                        // take this save for an administrator's change in Dashboard -> Users
+                        // (R-1042). Null when the master's own folder policy was copied: the
+                        // sign-in records what it applies.
+                        mappingEntry.LastAppliedFolders = request.EnabledFolders != null ? validatedFolders.ToList() : null;
                     }
 
                     // Store the profile's own tag lists, not the master-merged result, so later
@@ -2325,7 +2409,7 @@ namespace Jellyfin.Profiles.Controllers
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
         [ProducesResponseType(StatusCodes.Status401Unauthorized)]
         [ProducesResponseType(StatusCodes.Status404NotFound)]
-        public ActionResult KickBonfireMember([FromBody] KickBonfireRequest request)
+        public async Task<ActionResult> KickBonfireMember([FromBody] KickBonfireRequest request)
         {
             var config = Plugin.Instance?.Configuration;
             if (config == null) return BadRequest("Plugin configuration missing.");
@@ -2338,6 +2422,7 @@ namespace Jellyfin.Profiles.Controllers
             if (callerMapping != null && callerMapping.MasterUserId != masterId)
                 return Unauthorized("Only the master profile can manage Bonfire groups.");
 
+            string? newCode = null;
             lock (ConfigLock)
             {
                 var group = config.BonfireGroups.FirstOrDefault(g => g.OwnerUserId == masterId);
@@ -2352,8 +2437,15 @@ namespace Jellyfin.Profiles.Controllers
                     // is already a member and does not need it.
                     group.BonfireCode = GenerateSecureCode();
                     Plugin.Instance?.SaveConfiguration();
-                    return Ok(new { BonfireCode = group.BonfireCode });
+                    newCode = group.BonfireCode;
                 }
+            }
+
+            if (newCode != null)
+            {
+                // And what they had already opened is closed too (R-1302).
+                await SignOutClosedEntriesAsync().ConfigureAwait(false);
+                return Ok(new { BonfireCode = newCode });
             }
 
             return NotFound("Member not found in your Bonfire group.");
@@ -2397,7 +2489,7 @@ namespace Jellyfin.Profiles.Controllers
         [ProducesResponseType(StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
         [ProducesResponseType(StatusCodes.Status401Unauthorized)]
-        public ActionResult LeaveBonfire()
+        public async Task<ActionResult> LeaveBonfire()
         {
             var config = Plugin.Instance?.Configuration;
             if (config == null) return BadRequest("Plugin configuration missing.");
@@ -2406,6 +2498,7 @@ namespace Jellyfin.Profiles.Controllers
             if (currentUserIdVal == null) return Unauthorized();
             Guid masterId = currentUserIdVal.Value;
 
+            bool left = false;
             lock (ConfigLock)
             {
                 var joinedGroup = config.BonfireGroups.FirstOrDefault(g => g.MemberUserIds.Contains(masterId));
@@ -2413,8 +2506,14 @@ namespace Jellyfin.Profiles.Controllers
                 {
                     joinedGroup.MemberUserIds.Remove(masterId);
                     Plugin.Instance?.SaveConfiguration();
-                    return Ok();
+                    left = true;
                 }
+            }
+
+            if (left)
+            {
+                await SignOutClosedEntriesAsync().ConfigureAwait(false);
+                return Ok();
             }
 
             return BadRequest("You are not in any Bonfire group.");
@@ -2424,7 +2523,7 @@ namespace Jellyfin.Profiles.Controllers
         [ProducesResponseType(StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
         [ProducesResponseType(StatusCodes.Status401Unauthorized)]
-        public ActionResult DeleteBonfireGroup()
+        public async Task<ActionResult> DeleteBonfireGroup()
         {
             var config = Plugin.Instance?.Configuration;
             if (config == null) return BadRequest("Plugin configuration missing.");
@@ -2433,6 +2532,7 @@ namespace Jellyfin.Profiles.Controllers
             if (currentUserIdVal == null) return Unauthorized();
             Guid masterId = currentUserIdVal.Value;
 
+            bool deleted = false;
             lock (ConfigLock)
             {
                 var group = config.BonfireGroups.FirstOrDefault(g => g.OwnerUserId == masterId);
@@ -2440,8 +2540,14 @@ namespace Jellyfin.Profiles.Controllers
                 {
                     config.BonfireGroups.Remove(group);
                     Plugin.Instance?.SaveConfiguration();
-                    return Ok();
+                    deleted = true;
                 }
+            }
+
+            if (deleted)
+            {
+                await SignOutClosedEntriesAsync().ConfigureAwait(false);
+                return Ok();
             }
 
             return BadRequest("You do not own a Bonfire group.");
@@ -2451,7 +2557,7 @@ namespace Jellyfin.Profiles.Controllers
         [ProducesResponseType(StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
         [ProducesResponseType(StatusCodes.Status401Unauthorized)]
-        public ActionResult UpdateBonfireSettings([FromBody] UpdateBonfireSettingsRequest request)
+        public async Task<ActionResult> UpdateBonfireSettings([FromBody] UpdateBonfireSettingsRequest request)
         {
             var config = Plugin.Instance?.Configuration;
             if (config == null) return BadRequest("Plugin configuration missing.");
@@ -2498,6 +2604,8 @@ namespace Jellyfin.Profiles.Controllers
                 Plugin.Instance?.SaveConfiguration();
             }
 
+            // Hiding profiles, or withdrawing the home-network consent, closes doors too.
+            await SignOutClosedEntriesAsync().ConfigureAwait(false);
             return Ok();
         }
 
@@ -3184,17 +3292,32 @@ namespace Jellyfin.Profiles.Controllers
 
             lock (ConfigLock)
             {
-                // Forgetting a device also drops it from every whitelist that named it, and an
-                // empty whitelist means "any device". So forgetting the only device a profile
+                // This household's claim and this household's lists, nothing more (R-1048).
+                // It matched on the id alone across the server-wide list: any main account
+                // could forget another household's television, strip it from that household's
+                // device lists, and read that household's profile names off the refusal.
+                // Rename and merge always checked ownership; this did not.
+                var household = config.Mappings.Where(m => m.MasterUserId == masterId).ToList();
+                bool Matches(string? id) => string.Equals(id?.Trim(), request.DeviceId.Trim(), StringComparison.OrdinalIgnoreCase);
+                var records = config.KnownDevices.Where(d => Matches(d.DeviceId)).ToList();
+                var owned = records.Where(d => d.OwnedBy(masterId)).ToList();
+                // A device on one of its lists with no record left is still the household's
+                // to take off them: the device list shows it as "Previously allowed device".
+                var listed = household.Any(m => m.AllowedDeviceIds?.Any(Matches) == true);
+                if (owned.Count == 0 && !listed) return BadRequest("Unknown device.");
+
+                // Forgetting a device also drops it from every list that named it, and an
+                // empty list means "any device". So forgetting the only device a profile
                 // was restricted to would silently make that profile available everywhere —
                 // the exact widening RemoveStaleDevices is written to avoid, arrived at by a
                 // different route. Refuse and say which profiles are in the way; the
-                // administrator can loosen or re-point them deliberately.
-                var wouldUnrestrict = ProfilesLeftUnrestrictedBy(config, new[] { request.DeviceId });
+                // household can loosen or re-point them deliberately.
+                var wouldUnrestrict = HouseholdProfilesLeftUnrestrictedBy(config, new[] { request.DeviceId }, masterId);
                 if (wouldUnrestrict.Count > 0)
                 {
-                    var names = wouldUnrestrict
-                        .Select(id => _userManager.GetUserById(id)?.Username ?? id.ToString())
+                    var names = household
+                        .Where(m => wouldUnrestrict.Contains(m.ProfileUserId))
+                        .Select(m => m.ProfileName)
                         .ToList();
                     return BadRequest(
                         "This is the only device allowed for "
@@ -3202,15 +3325,21 @@ namespace Jellyfin.Profiles.Controllers
                         + ". Allow another device for those profiles first, or clear their device list.");
                 }
 
-                var toRemove = config.KnownDevices
-                    .Where(d => string.Equals(d.DeviceId, request.DeviceId, StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-                foreach (var d in toRemove)
-                    config.KnownDevices.Remove(d);
+                // Another household that uses it keeps it, and sees it shown as theirs.
+                foreach (var d in owned)
+                {
+                    var others = Auth.DeviceRegistry.AddOwners(d.Owners, d.MasterUserId).Where(o => o != masterId).ToList();
+                    if (others.Count == 0)
+                    {
+                        config.KnownDevices.Remove(d);
+                        continue;
+                    }
+                    d.Owners = others;
+                    if (d.MasterUserId == masterId) d.MasterUserId = others[others.Count - 1];
+                }
 
-                foreach (var mapping in config.Mappings)
-                    mapping.AllowedDeviceIds?.RemoveAll(id =>
-                        string.Equals(id, request.DeviceId, StringComparison.OrdinalIgnoreCase));
+                foreach (var mapping in household)
+                    mapping.AllowedDeviceIds?.RemoveAll(id => Matches(id));
 
                 Plugin.Instance?.SaveConfiguration();
             }
@@ -3258,10 +3387,16 @@ namespace Jellyfin.Profiles.Controllers
                 var owned = config.KnownDevices.Where(d =>
                     (string.Equals(d.DeviceId, request.FromDeviceId, StringComparison.OrdinalIgnoreCase)
                      || string.Equals(d.DeviceId, request.IntoDeviceId, StringComparison.OrdinalIgnoreCase))
-                    && d.MasterUserId == masterId).ToList();
+                    && d.OwnedBy(masterId)).ToList();
 
                 if (owned.Count != 2)
                     return BadRequest("Both devices must be ones this account has used.");
+
+                // A shared device: merging would rewrite the other household's device lists and
+                // owners on this household's say alone.
+                if (!DeviceIsHouseholdOnly(config, request.FromDeviceId, masterId)
+                    || !DeviceIsHouseholdOnly(config, request.IntoDeviceId, masterId))
+                    return BadRequest("One of these devices is also used by another household, so it can't be merged. Forget it for this household instead.");
 
                 if (!MergeDeviceRecords(config, request.FromDeviceId, request.IntoDeviceId))
                     return BadRequest("Those devices could not be merged.");
@@ -3306,7 +3441,12 @@ namespace Jellyfin.Profiles.Controllers
             {
                 // This household's devices only. The list is server-wide, and grouping across
                 // it could fold another household's hardware into this one's whitelist.
-                var owned = config.KnownDevices.Where(d => d.MasterUserId == masterId).ToList();
+                // And of those, only the ones no other household shares: a merge rewrites every
+                // list that names either id and moves owners across, which on a shared device
+                // would change another household's whitelist on this household's say alone.
+                var mine = config.KnownDevices.Where(d => d.OwnedBy(masterId)).ToList();
+                var owned = mine.Where(d => DeviceIsHouseholdOnly(config, d.DeviceId, masterId)).ToList();
+                var skippedShared = mine.Count - owned.Count;
                 var groups = GroupLikelyDuplicates(owned);
 
                 if (!apply)
@@ -3314,6 +3454,7 @@ namespace Jellyfin.Profiles.Controllers
                     return Ok(new
                     {
                         applied = false,
+                        skippedShared,
                         groups = groups.Select(g => new
                         {
                             keep = new { g[0].DeviceId, g[0].DeviceName, g[0].Client, g[0].LastSeen },
@@ -3334,7 +3475,7 @@ namespace Jellyfin.Profiles.Controllers
                 }
 
                 if (merged > 0) Plugin.Instance?.SaveConfiguration();
-                return Ok(new { applied = true, merged, groups = groups.Count });
+                return Ok(new { applied = true, merged, groups = groups.Count, skippedShared });
             }
         }
 
@@ -3367,7 +3508,7 @@ namespace Jellyfin.Profiles.Controllers
             {
                 var device = config.KnownDevices.FirstOrDefault(d =>
                     string.Equals(d.DeviceId, request.DeviceId, StringComparison.OrdinalIgnoreCase)
-                    && d.MasterUserId == masterId);
+                    && d.OwnedBy(masterId));
 
                 if (device == null) return BadRequest("Unknown device.");
 

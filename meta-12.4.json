@@ -1,14 +1,14 @@
 {
   "category": "General",
-  "changelog": "Rebuilt for Jellyfin 12.4 on Media-Serv (lsheardo-12.4 branch). **Added**\n\n- Catalan and Spanish.\n\n**Changed**\n\n- Bonfire now uses the language set in Jellyfin (Settings → Display), not the browser's.",
+  "changelog": "Rebuilt for Jellyfin 12.4 on Media-Serv (lsheardo-12.4 branch) from upstream 1.7.5, plus our fixes (1.7.5.1): the index.html file patch honours Jellyfin's Base URL; a cross-household sign-out forgets its entry only after the device is signed out; device merges never rewrite another household's device lists; a skipped PIN no longer refills the shared PIN allowance; a clashing rename is refused before the picture is saved. Upstream 1.7.2-1.7.5: Roku PIN-bypass fix and further security fixes.",
   "description": "Adds multi-user profile switching to Jellyfin. A single account can have up to five isolated profiles — each with its own watch history, parental controls, and library access.",
   "guid": "b1462fca-774b-4b13-8d02-e2d4f2bc18b9",
   "name": "Bonfire",
   "overview": "Multi-user profile switching for Jellyfin.",
   "owner": "AHouseOfBards",
   "targetAbi": "12.4.0.0",
-  "timestamp": "2026-11-02T21:48:11Z",
-  "version": "1.7.1.0",
+  "timestamp": "2026-11-10T01:34:43Z",
+  "version": "1.7.5.1",
   "status": "Active",
   "autoUpdate": false,
   "assemblies": [

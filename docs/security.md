@@ -13,9 +13,9 @@ These hold in every app and can't be turned off from a browser.
   main account, such as remote access, schedules, bitrate, downloads and Live TV. A profile
   never gets more than its main account.
 - **PINs.** Every switch and sign-in checks the PIN on the server.
-  - The switcher allows 5 wrong PINs per 15 minutes from one address, and 10 per profile
-    from all addresses together.
-  - Other apps' sign-in screens allow 5 per 15 minutes and 20 a day, per account.
+  - The switcher allows 5 wrong PINs per 15 minutes from one address.
+  - Every PIN check, wherever it is typed, shares one allowance per account: 5 per 15
+    minutes and 20 a day, from all addresses together.
 - **Other households.** In a shared Bonfire, opening someone else's account or profile
   needs its PIN. The exception is when its owner has turned on *Let my Bonfire switch
   into my account on this network* and you're on their network. Hidden profiles can't be
@@ -29,7 +29,9 @@ These hold in every app and can't be turned off from a browser.
   are for children, give the main account a PIN.
 - **Device limits.** A device is identified by the ID its app sends, and an app can send
   any ID. A device limit stops normal use on other devices, not someone who copies the
-  allowed device's ID. The same goes for PIN-less profiles on other apps' sign-in screens.
+  allowed device's ID. The same goes for PIN-less profiles on other apps' sign-in screens,
+  and for PINs typed in other apps, which only work on a device your household has signed
+  in on with a password.
 - **"Your home network".** This is whatever Jellyfin counts as local. Behind a reverse
   proxy that isn't listed under **Dashboard → Networking → Known Proxies**, every visitor
   looks local.

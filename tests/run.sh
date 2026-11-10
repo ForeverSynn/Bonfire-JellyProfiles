@@ -41,8 +41,8 @@ run() {                       # run <label> <command...>
 
 # The framework the C# harnesses load the plugin from. They set their own TargetFramework
 # from it too, because a net9 harness cannot load a net10 assembly.
-TFM="net9.0"
-[ "$WHICH" = "cs10" ] && TFM="net10.0"
+# lsheardo-12.4: this branch builds net10.0 only, so every C# run uses it.
+TFM="net10.0"
 
 if [ "$WHICH" != "js" ]; then
     echo "── Building the plugin (Release) ──────────────────────────────"
