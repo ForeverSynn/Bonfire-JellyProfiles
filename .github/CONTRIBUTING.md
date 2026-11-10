@@ -14,7 +14,7 @@ tests/run.sh
 On Windows, run `tests\run.ps1` instead. It runs every test, and CI runs the same
 command, so if it passes for you it passes in CI.
 
-To try a build on your server, copy `bin/Release/net9.0/Jellyfin.Profiles.dll` into
+To try a build on your server, copy `bin/Release/net10.0/Jellyfin.Profiles.dll` into
 Jellyfin's plugins folder and restart Jellyfin. On Docker, restart the container.
 
 ## Adding a translation

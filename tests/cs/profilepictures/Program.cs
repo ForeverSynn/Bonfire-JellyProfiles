@@ -54,7 +54,8 @@ try
     (string Url, string Error) Run(string method, params object[] args)
     {
         var m = typeof(ProfilesBaseController).GetMethod(method, Any);
-        if (m == null) return (null, null);
+        // A missing method is a failure, not a quiet (null, null) that later checks could read as a pass.
+        if (m == null) throw new MissingMethodException(nameof(ProfilesBaseController), method);
         // The build with the bug takes fewer arguments.
         var r = m.Invoke(c, args.Take(m.GetParameters().Length).ToArray());
         if (r is System.Runtime.CompilerServices.ITuple t) return ((string)t[0], (string)t[1]);

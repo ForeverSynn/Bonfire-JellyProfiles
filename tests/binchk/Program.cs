@@ -66,6 +66,21 @@ bool Judged(MemberReference mr)
     return mr.Parent.Kind == HandleKind.TypeSpecification;   // judged by what resolution says
 }
 
+// The assembly a member's declaring type comes from, read from the metadata (nested types
+// walk out to their outermost type). Null when it is not a plain assembly reference.
+string? DeclaringAssembly(MemberReference mr)
+{
+    if (mr.Parent.Kind != HandleKind.TypeReference) return null;
+    var tr = md.GetTypeReference((TypeReferenceHandle)mr.Parent);
+    while (tr.ResolutionScope.Kind == HandleKind.TypeReference)
+        tr = md.GetTypeReference((TypeReferenceHandle)tr.ResolutionScope);
+    if (tr.ResolutionScope.Kind != HandleKind.AssemblyReference) return null;
+    return md.GetString(md.GetAssemblyReference((AssemblyReferenceHandle)tr.ResolutionScope).Name);
+}
+static bool JellyfinAssembly(string? name) => name != null
+    && (name.StartsWith("Jellyfin.", StringComparison.Ordinal) || name.StartsWith("MediaBrowser.", StringComparison.Ordinal)
+        || name.StartsWith("Emby.", StringComparison.Ordinal));
+
 int ok = 0, missing = 0, unjudged = 0;
 foreach (var h in md.MemberReferences)
 {
@@ -80,6 +95,13 @@ foreach (var h in md.MemberReferences)
         if (d.StartsWith("(generic", StringComparison.Ordinal) && !ex.Message.Contains("MediaBrowser") && !ex.Message.Contains("Jellyfin")) { unjudged++; continue; }
         missing++;
         Console.WriteLine("  MISSING  " + d + "   [" + ex.GetType().Name + ": " + ex.Message + "]");
+    }
+    // A Jellyfin assembly the plugin references that the server does not ship is as missing
+    // as any member of it: every call into it fails at run time (CodeRabbit on PR #1).
+    catch (Exception ex) when ((ex is FileNotFoundException or FileLoadException) && JellyfinAssembly(DeclaringAssembly(mr)))
+    {
+        missing++;
+        Console.WriteLine("  MISSING  " + Describe(mr) + "   [assembly " + DeclaringAssembly(mr) + " not found: " + ex.GetType().Name + "]");
     }
     catch (Exception) { unjudged++; }
 }

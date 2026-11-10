@@ -7,6 +7,9 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Profiles.Configuration;
 using MediaBrowser.Common.Configuration;
+using MediaBrowser.Common.Net;
+using MediaBrowser.Controller.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using System.Linq;
 using MediaBrowser.Controller.Library;
@@ -39,15 +42,21 @@ namespace Jellyfin.Profiles
         // reading exactly as before.
         internal static string ScriptVersion => WebInjection.ScriptVersion;
 
-        private static string BodyScriptTag => WebInjection.BodyScriptTag;
+        // The tag as it must read on this server: under a Base URL it carries the prefix,
+        // so the manual-fix line in the logs is one that actually works.
+        private string BodyScriptTag => WebInjection.BodyScriptTagAt(ReadBaseUrl());
 
         /// <summary>Version recorded in index.html’s script tag, or null if absent/unparseable.</summary>
         private static string? GetInjectedScriptVersion(string html)
             => WebInjection.GetInjectedScriptVersion(html);
 
-        /// <summary>True when index.html’s script tag already points at this build.</summary>
-        private static bool IsScriptVersionCurrent(string html)
-            => WebInjection.IsScriptVersionCurrent(html);
+        /// <summary>
+        /// True when index.html’s script tag already points at this build AND at this
+        /// server's Base URL. A tag with the right version and the wrong prefix is broken:
+        /// the browser gets the web page back instead of the script.
+        /// </summary>
+        private static bool IsScriptVersionCurrent(string html, string baseUrl)
+            => WebInjection.IsScriptVersionCurrent(html) && WebInjection.IsPrefixCurrent(html, baseUrl);
 
         /// <summary>
         /// The OS account the Jellyfin process is running under.
@@ -285,15 +294,48 @@ namespace Jellyfin.Profiles
 
         private readonly IUserManager _userManager;
 
+        // For the Base URL the file patch has to write into the tag. Null only where a
+        // caller has none to give (tests); the URL then reads as unset.
+        private readonly IServerConfigurationManager? _serverConfig;
+
         public ProfilesBootstrapTask(
             IApplicationPaths appPaths,
             IUserManager userManager,
             ILogger<ProfilesBootstrapTask> logger)
+            : this(appPaths, userManager, logger, null)
+        {
+        }
+
+        [ActivatorUtilitiesConstructor]
+        public ProfilesBootstrapTask(
+            IApplicationPaths appPaths,
+            IUserManager userManager,
+            ILogger<ProfilesBootstrapTask> logger,
+            IServerConfigurationManager? serverConfig)
         {
             _appPaths = appPaths;
             _userManager = userManager;
             _logger = logger;
+            _serverConfig = serverConfig;
             _current = this;
+        }
+
+        /// <summary>
+        /// The Base URL (Dashboard, Networking), read the way ProfilesIndexMiddleware reads
+        /// it, or empty when there is none or it cannot be read.
+        /// </summary>
+        private string ReadBaseUrl()
+        {
+            try
+            {
+                return _serverConfig == null
+                    ? string.Empty
+                    : WebInjection.NormalizeBaseUrl(_serverConfig.GetNetworkConfiguration().BaseUrl);
+            }
+            catch (Exception)
+            {
+                return string.Empty;
+            }
         }
 
         // ── Client PIN login ────────────────────────────────────────────────────────
@@ -657,7 +699,7 @@ namespace Jellyfin.Profiles
                     var html = File.ReadAllText(indexPath);
                     var hasBody = html.Contains(BodyMarker, StringComparison.Ordinal);
                     var hasHead = html.Contains(HeadMarker, StringComparison.Ordinal);
-                    var versionCurrent = IsScriptVersionCurrent(html);
+                    var versionCurrent = IsScriptVersionCurrent(html, self.ReadBaseUrl());
 
                     // In "both" mode the middleware picks up whatever the file patch could
                     // not do, so an unpatched or stale index.html stops being a failure and
@@ -875,9 +917,12 @@ namespace Jellyfin.Profiles
                 // some version is present. After a plugin update the old ?v=1.1.x tag
                 // stays in index.html and the browser keeps serving the cached old JS,
                 // so new features (like tag filtering) silently never appear.
-                bool bodyVersionCurrent = IsScriptVersionCurrent(html);
+                // And at this server's Base URL: a tag written before one was set (or for an
+                // old one) loads the web page instead of the script, so it counts as stale.
+                var baseUrl = ReadBaseUrl();
+                bool bodyVersionCurrent = IsScriptVersionCurrent(html, baseUrl);
 
-                if (hasBody && bodyVersionCurrent && hasHead)
+                if (WebInjection.IsFullyInjectedAt(html, baseUrl))
                 {
                     _logger.LogDebug(
                         "ProfilesPlugin: Scripts already correctly present in {Path} — no changes made.",
@@ -902,7 +947,7 @@ namespace Jellyfin.Profiles
                 }
 
                 // Both fragments in one pass, shared with ProfilesIndexMiddleware.
-                bool changed = WebInjection.Inject(html, out html);
+                bool changed = WebInjection.InjectAt(html, baseUrl, out html);
 
                 // The body script is what makes the switcher work at all; the head script only
                 // prevents a flash of content. Track them separately so a missing <head> anchor

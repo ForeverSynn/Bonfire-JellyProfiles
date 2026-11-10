@@ -195,6 +195,76 @@ Console.WriteLine("── Forgetting a device ───────────�
     Ok("and once it is free, its own device is forgotten outright", r.status == 200 && !Has("my-tv"), r.status + " " + r.message);
 }
 
+// ── Merging devices: only what this household alone uses (CodeRabbit on ForeverSynn PR #1) ──
+// A merge rewrites every list that names either id and moves owners across. A co-owner could
+// merge a shared device and so rewrite another household's whitelist and owners on its own
+// say. Like forgetting (above), it now acts for the caller's household only: a shared device
+// is refused (pair) or left out (duplicates sweep); its own devices still merge.
+Console.WriteLine();
+Console.WriteLine("── Merging devices ─────────────────────────────────────────────");
+{
+    var knownType = asm.GetType("Jellyfin.Profiles.Configuration.KnownDevice", true);
+    var known = (IList)cfgType.GetProperty("KnownDevices").GetValue(config);
+    object Device(string id, Guid last, string name, params Guid[] owners)
+    {
+        var d = Activator.CreateInstance(knownType);
+        knownType.GetProperty("DeviceId").SetValue(d, id);
+        knownType.GetProperty("MasterUserId").SetValue(d, last);
+        knownType.GetProperty("DeviceName").SetValue(d, name);
+        knownType.GetProperty("Client").SetValue(d, "Jellyfin Web");
+        knownType.GetProperty("LastSeen").SetValue(d, DateTime.UtcNow.AddMinutes(-known.Count));
+        knownType.GetProperty("Owners").SetValue(d, owners.ToList());
+        known.Add(d);
+        return d;
+    }
+    List<string> Allowed(object row) => (List<string>)mapType.GetProperty("AllowedDeviceIds").GetValue(row);
+    bool Has(string id) => known.Cast<object>().Any(d => (string)knownType.GetProperty("DeviceId").GetValue(d) == id);
+    bool Owns(string id, Guid who) => known.Cast<object>().Where(d => (string)knownType.GetProperty("DeviceId").GetValue(d) == id)
+        .Any(d => (bool)knownType.GetMethod("OwnedBy").Invoke(d, new object[] { who }));
+
+    var A = Guid.NewGuid(); world.Add(A, "Alpha"); Map(A, A);
+    var A_KID = Guid.NewGuid(); world.Add(A_KID, "Alpha_Kid"); var aKid = Map(A_KID, A);
+    var B = Guid.NewGuid(); world.Add(B, "Beta"); Map(B, B);
+    var B_KID = Guid.NewGuid(); world.Add(B_KID, "Beta_Kid"); var bKid = Map(B_KID, B);
+
+    // Two ids of one shared lounge browser (same 40-character prefix: same user agent), and
+    // two of Alpha's own laptop.
+    const string Lounge = "TW96aWxsYS81LjAgKFgxMTsgTGludXggeDg2XzY0KSBG";
+    const string Laptop = "TW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2lu";
+    Device(Lounge + "aaa1", A, "Firefox", A, B);
+    Device(Lounge + "bbb2", B, "Firefox", A, B);
+    Device(Laptop + "ccc3", A, "Edge", A);
+    Device(Laptop + "ddd4", A, "Edge", A);
+    Allowed(aKid).AddRange(new[] { Lounge + "aaa1", Laptop + "ddd4" });
+    Allowed(bKid).AddRange(new[] { Lounge + "bbb2" });
+
+    var r = Call("MergeDevices", A, new() { ["FromDeviceId"] = Lounge + "bbb2", ["IntoDeviceId"] = Lounge + "aaa1" });
+    Ok("a co-owner can't merge a device another household also uses", r.status == 400 && Has(Lounge + "bbb2"), r.status + " " + r.message);
+    Ok("so the other household's list is untouched", Allowed(bKid).SequenceEqual(new[] { Lounge + "bbb2" }), string.Join(",", Allowed(bKid)));
+    Ok("and the refusal names no other household or profile", !(r.message ?? "").Contains("Beta"), r.message);
+
+    r = Call("MergeDuplicateDevices", A, raw: new object[] { true });
+    Ok("the duplicates sweep runs", r.status == 200, r.status + " " + r.message);
+    Ok("and leaves the shared lounge records alone",
+       Has(Lounge + "aaa1") && Has(Lounge + "bbb2") && Allowed(bKid).SequenceEqual(new[] { Lounge + "bbb2" })
+       && Owns(Lounge + "bbb2", B));
+    Ok("while still folding this household's own laptop ids into one",
+       Has(Laptop + "ccc3") != Has(Laptop + "ddd4") && Allowed(aKid).Count(id => id.StartsWith(Laptop)) == 1,
+       string.Join(",", Allowed(aKid)));
+
+    Device(Laptop + "eee5", A, "Edge", A);
+    var keepId = Has(Laptop + "ccc3") ? Laptop + "ccc3" : Laptop + "ddd4";
+    r = Call("MergeDevices", A, new() { ["FromDeviceId"] = Laptop + "eee5", ["IntoDeviceId"] = keepId });
+    Ok("merging two of its own devices by hand still works", r.status == 200 && !Has(Laptop + "eee5"), r.status + " " + r.message);
+
+    // A device only this household owns, but another household's profile still lists the id
+    // (a whitelist entry outlives the record): merging would rewrite that list too.
+    Device(Laptop + "fff6", A, "Edge", A);
+    Allowed(bKid).Add(Laptop + "fff6");
+    r = Call("MergeDevices", A, new() { ["FromDeviceId"] = Laptop + "fff6", ["IntoDeviceId"] = keepId });
+    Ok("nor one another household's profile still lists", r.status == 400 && Allowed(bKid).Contains(Laptop + "fff6"), r.status + " " + r.message);
+}
+
 if (fails.Count > 0)
 {
     Console.WriteLine(pass + " passed, " + fails.Count + " failed");

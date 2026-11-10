@@ -992,11 +992,16 @@ namespace Jellyfin.Profiles.Controllers
             return null;
         }
 
-        /// <summary>The right PIN, or none needed: both allowances start again.</summary>
-        protected static void EndPinAttempt(string addressKey, Guid profileId)
+        /// <summary>
+        /// A switch that went through. The address allowance starts again either way; the
+        /// account's shared PIN allowance only when the PIN was actually checked and right.
+        /// A switch that needed no PIN (none set, or skipped on the home network) proves
+        /// nothing about the PIN, so it must not refill the allowance other doors draw on.
+        /// </summary>
+        protected static void EndPinAttempt(string addressKey, Guid profileId, bool pinVerified)
         {
             RateLimiter.Pin.Reset(addressKey);
-            PinBudget.End(profileId);
+            if (pinVerified) PinBudget.End(profileId);
         }
 
         /// <summary>
@@ -1291,6 +1296,30 @@ namespace Jellyfin.Profiles.Controllers
         /// and no restriction is switched off in the middle of the operation.
         /// </para>
         /// </summary>
+        /// <summary>
+        /// True when the device id belongs to this household alone: every record for it is
+        /// owned only by <paramref name="masterId"/>, and no other household's profile lists
+        /// it. A merge rewrites every list that names either id and moves owners across, so on
+        /// a shared device it would change another household's whitelist and ownership with
+        /// only one of the households asking. Deleting a shared device already acts for the
+        /// caller's household only (R-1048); merging one is refused instead, because a merge
+        /// cannot be split per household.
+        /// </summary>
+        internal static bool DeviceIsHouseholdOnly(PluginConfiguration config, string? deviceId, Guid masterId)
+        {
+            var id = deviceId?.Trim();
+            if (string.IsNullOrEmpty(id) || masterId == Guid.Empty) return false;
+            bool Matches(string? other) => string.Equals(other?.Trim(), id, StringComparison.OrdinalIgnoreCase);
+
+            foreach (var d in config.KnownDevices.Where(d => Matches(d.DeviceId)))
+            {
+                if (Auth.DeviceRegistry.AddOwners(d.Owners, d.MasterUserId).Any(o => o != masterId)) return false;
+            }
+
+            return !config.Mappings.Any(m => m.MasterUserId != masterId
+                && m.AllowedDeviceIds?.Any(Matches) == true);
+        }
+
         internal static bool MergeDeviceRecords(PluginConfiguration config, string? fromId, string? intoId)
         {
             fromId = fromId?.Trim();
@@ -1649,13 +1678,12 @@ namespace Jellyfin.Profiles.Controllers
             }
             if (closed.Count == 0) return 0;
 
-            lock (ConfigLock)
-            {
-                config.CrossHouseholdEntries?.RemoveAll(e => closed.Any(c => c.ProfileUserId == e.ProfileUserId
-                    && string.Equals(c.DeviceId, e.DeviceId, StringComparison.Ordinal)));
-                Plugin.Instance?.SaveConfiguration();
-            }
-
+            // Sign out first, forget second. An entry is the only record that a device still
+            // holds another household's token; dropping it before Logout succeeds meant one
+            // failed call (or a device manager that could not be asked) left the device
+            // signed in with nothing left to retry it. So an entry goes only once every
+            // matching device is signed out, or a query that worked found none.
+            var done = new List<CrossHouseholdEntry>();
             int signedOut = 0;
             foreach (var e in closed)
             {
@@ -1664,16 +1692,28 @@ namespace Jellyfin.Profiles.Controllers
                     // The (account, device) pair: a device id alone would sign every account on
                     // that television out, its own household's included.
                     var devices = _deviceManager?.GetDevices(new Jellyfin.Data.Queries.DeviceQuery { DeviceId = e.DeviceId, UserId = e.ProfileUserId }).Items;
-                    if (devices == null) continue;
+                    if (devices == null) continue;   // could not ask: keep it for the next pass
                     foreach (var device in devices)
                     {
                         await _sessionManager.Logout(device).ConfigureAwait(false);
                         signedOut++;
                     }
+                    done.Add(e);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "ProfilesPlugin: could not sign {ProfileId} out on device {DeviceId}.", e.ProfileUserId, e.DeviceId);
+                    _logger.LogWarning(ex, "ProfilesPlugin: could not sign {ProfileId} out on device {DeviceId}; it stays listed and is tried again on the next change.", e.ProfileUserId, e.DeviceId);
+                }
+            }
+
+            if (done.Count > 0)
+            {
+                lock (ConfigLock)
+                {
+                    // Exactly the entries that were evaluated. One recorded again while the
+                    // sign-out ran (a new /switch on the same device) is a new door and stays.
+                    var removed = config.CrossHouseholdEntries?.RemoveAll(live => done.Any(d => IsSameCrossHouseholdEntry(d, live))) ?? 0;
+                    if (removed > 0) Plugin.Instance?.SaveConfiguration();
                 }
             }
 
@@ -1683,6 +1723,17 @@ namespace Jellyfin.Profiles.Controllers
             }
             return signedOut;
         }
+
+        /// <summary>
+        /// The same entry, not merely the same (device, account): every field matches, so an
+        /// entry replaced while a sign-out was running is not mistaken for the one evaluated.
+        /// </summary>
+        internal static bool IsSameCrossHouseholdEntry(CrossHouseholdEntry a, CrossHouseholdEntry b)
+            => a.ProfileUserId == b.ProfileUserId
+               && a.EnteredBy == b.EnteredBy
+               && string.Equals(a.DeviceId, b.DeviceId, StringComparison.Ordinal)
+               && a.EnteredUtc == b.EnteredUtc
+               && a.WithoutPin == b.WithoutPin;
 
         protected int GetMaxProfilesForUser(Guid userId, PluginConfiguration config)
         {

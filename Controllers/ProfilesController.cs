@@ -765,6 +765,7 @@ namespace Jellyfin.Profiles.Controllers
 
             // Verify PIN if set
             var pinHashToCheck = mapping?.PinHash;
+            bool pinVerified = false;
             if (!string.IsNullOrEmpty(pinHashToCheck))
             {
                 bool bypass = CanSkipPin(mapping, isLocal, isCrossAccountMasterSwitch, householdLanBypass);
@@ -794,10 +795,11 @@ namespace Jellyfin.Profiles.Controllers
                     {
                         return BadRequest("Invalid PIN code.");
                     }
+                    pinVerified = true;
                 }
             }
 
-            EndPinAttempt(rateLimitKey, request.ProfileId);
+            EndPinAttempt(rateLimitKey, request.ProfileId, pinVerified);
             tAuth = sw.ElapsedMilliseconds;
 
             var targetUser = _userManager.GetUserById(request.ProfileId);
@@ -996,6 +998,7 @@ namespace Jellyfin.Profiles.Controllers
             }
 
             var target = rules.Target;
+            bool pinVerified = false;
             if (target != null && !string.IsNullOrEmpty(target.PinHash)
                 && !CanSkipPin(target, isLocal, rules.CrossHousehold, rules.HouseholdLanBypass))
             {
@@ -1006,9 +1009,10 @@ namespace Jellyfin.Profiles.Controllers
                 {
                     return BadRequest("Invalid PIN.");
                 }
+                pinVerified = true;
             }
 
-            EndPinAttempt(rateLimitKey, request.ProfileId);
+            EndPinAttempt(rateLimitKey, request.ProfileId, pinVerified);
             return Ok();
         }
 
@@ -1705,6 +1709,24 @@ namespace Jellyfin.Profiles.Controllers
                 ? NormalizeTags(request.AllowedTags)
                 : existingMapping?.AllowedTags;
 
+            // A rename that would clash is refused before anything is written, the picture
+            // included: checking it after the picture was saved answered 400 with the new
+            // picture already on disk.
+            string? renameTo = null;
+            if (request.ProfileId != masterUserId)
+            {
+                string systemUsername = $"{masterUser.Username}_{request.ProfileName.Trim().Replace(" ", "")}";
+                if (!string.Equals(targetUser.Username, systemUsername, StringComparison.OrdinalIgnoreCase))
+                {
+                    var existingUser = GetAllUsers().FirstOrDefault(u => string.Equals(u.Username, systemUsername, StringComparison.OrdinalIgnoreCase));
+                    if (existingUser != null)
+                    {
+                        return BadRequest("A profile with this name already exists.");
+                    }
+                    renameTo = systemUsername;
+                }
+            }
+
             // The picture first, before anything else is written. A refused one answers 400
             // with the reason and leaves the profile exactly as it was: the picture it has,
             // its name and everything else in this request. A rejected picture used to be
@@ -1727,20 +1749,11 @@ namespace Jellyfin.Profiles.Controllers
                 imageChanged = true;
             }
 
-            // Renaming logic
-            if (request.ProfileId != masterUserId)
+            // Renaming logic (the clash was checked above, before the picture)
+            if (renameTo != null)
             {
-                string systemUsername = $"{masterUser.Username}_{request.ProfileName.Trim().Replace(" ", "")}";
-                if (!string.Equals(targetUser.Username, systemUsername, StringComparison.OrdinalIgnoreCase))
-                {
-                    var existingUser = GetAllUsers().FirstOrDefault(u => string.Equals(u.Username, systemUsername, StringComparison.OrdinalIgnoreCase));
-                    if (existingUser != null)
-                    {
-                        return BadRequest("A profile with this name already exists.");
-                    }
-                    targetUser.Username = systemUsername;
-                    await _userManager.UpdateUserAsync(targetUser).ConfigureAwait(false);
-                }
+                targetUser.Username = renameTo;
+                await _userManager.UpdateUserAsync(targetUser).ConfigureAwait(false);
             }
 
             // Update policy for sub-profiles
@@ -3379,6 +3392,12 @@ namespace Jellyfin.Profiles.Controllers
                 if (owned.Count != 2)
                     return BadRequest("Both devices must be ones this account has used.");
 
+                // A shared device: merging would rewrite the other household's device lists and
+                // owners on this household's say alone.
+                if (!DeviceIsHouseholdOnly(config, request.FromDeviceId, masterId)
+                    || !DeviceIsHouseholdOnly(config, request.IntoDeviceId, masterId))
+                    return BadRequest("One of these devices is also used by another household, so it can't be merged. Forget it for this household instead.");
+
                 if (!MergeDeviceRecords(config, request.FromDeviceId, request.IntoDeviceId))
                     return BadRequest("Those devices could not be merged.");
 
@@ -3422,7 +3441,12 @@ namespace Jellyfin.Profiles.Controllers
             {
                 // This household's devices only. The list is server-wide, and grouping across
                 // it could fold another household's hardware into this one's whitelist.
-                var owned = config.KnownDevices.Where(d => d.OwnedBy(masterId)).ToList();
+                // And of those, only the ones no other household shares: a merge rewrites every
+                // list that names either id and moves owners across, which on a shared device
+                // would change another household's whitelist on this household's say alone.
+                var mine = config.KnownDevices.Where(d => d.OwnedBy(masterId)).ToList();
+                var owned = mine.Where(d => DeviceIsHouseholdOnly(config, d.DeviceId, masterId)).ToList();
+                var skippedShared = mine.Count - owned.Count;
                 var groups = GroupLikelyDuplicates(owned);
 
                 if (!apply)
@@ -3430,6 +3454,7 @@ namespace Jellyfin.Profiles.Controllers
                     return Ok(new
                     {
                         applied = false,
+                        skippedShared,
                         groups = groups.Select(g => new
                         {
                             keep = new { g[0].DeviceId, g[0].DeviceName, g[0].Client, g[0].LastSeen },
@@ -3450,7 +3475,7 @@ namespace Jellyfin.Profiles.Controllers
                 }
 
                 if (merged > 0) Plugin.Instance?.SaveConfiguration();
-                return Ok(new { applied = true, merged, groups = groups.Count });
+                return Ok(new { applied = true, merged, groups = groups.Count, skippedShared });
             }
         }
 

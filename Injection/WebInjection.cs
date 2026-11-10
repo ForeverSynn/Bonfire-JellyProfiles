@@ -265,7 +265,7 @@ namespace Jellyfin.Profiles
                && IsScriptVersionCurrent(html)
                && IsPrefixCurrent(html, baseUrl);
 
-        private static bool IsPrefixCurrent(string html, string? baseUrl)
+        internal static bool IsPrefixCurrent(string html, string? baseUrl)
         {
             var m = InjectedPrefixRegex.Match(html);
             return m.Success

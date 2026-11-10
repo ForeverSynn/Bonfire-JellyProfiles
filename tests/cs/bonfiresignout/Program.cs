@@ -217,6 +217,58 @@ r = Call("UpdateBonfireSettings", OTHER, Body(("HideMySubProfilesFromOthers", fa
 Ok("withdrawing the consent signs out what came in on it alone", r.status == 200 && !SignedIn(KIDN, "living-room"), Text(r));
 fires.Remove(g1);
 
+// ── A sign-out that fails is kept and retried (CodeRabbit on ForeverSynn PR #1) ─────
+// The entry was forgotten before Logout ran, so one failed call left the device signed in
+// with nothing left to retry it.
+Section("A failed sign-out is kept and retried");
+
+var entriesProp = cfgType.GetProperty("CrossHouseholdEntries");
+IList Entries() => (IList)entriesProp.GetValue(config);
+object Entry(Guid p, string dev) => Entries()?.Cast<object>().FirstOrDefault(e =>
+    (Guid)e.GetType().GetProperty("ProfileUserId").GetValue(e) == p
+    && (string)e.GetType().GetProperty("DeviceId").GetValue(e) == dev);
+
+mapType.GetProperty("AllowHouseholdLanBypass").SetValue(Row(OTHER), false);
+world.Sessions.RemoveAll(s => s.UserId == KIDN);
+g1 = Join(OTHER, MAIN);
+r = Call("SwitchProfile", MAIN, Body(("ProfileId", KIDN), ("Pin", "2468")), "den-tv");
+Ok("a member opens the neighbour's kid on the den TV", r.status == 200 && SignedIn(KIDN, "den-tv") && Entry(KIDN, "den-tv") != null, Text(r));
+world.LogoutFails = true;
+r = Call("KickBonfireMember", OTHER, Body(("MemberId", MAIN)), "neighbour-phone");
+Ok("the kick itself still works when Jellyfin can't sign the TV out", r.status == 200, Text(r));
+Ok("the entry is kept for a retry", Entry(KIDN, "den-tv") != null);
+world.LogoutFails = false;
+r = Call("UpdateBonfireSettings", OTHER, Body(("HideMySubProfilesFromOthers", false), ("HideOthersSubProfilesFromMe", false)));
+Ok("the next change signs the TV out", r.status == 200 && !SignedIn(KIDN, "den-tv"), Text(r));
+Ok("and only then forgets the entry", Entry(KIDN, "den-tv") == null);
+fires.Remove(g1);
+
+// ── An entry recorded again while the sign-out ran stays ────────────────────────────
+Section("An entry replaced during the sign-out stays");
+
+g1 = Join(OTHER, MAIN);
+r = Call("SwitchProfile", MAIN, Body(("ProfileId", KIDN), ("Pin", "2468")), "attic-tv");
+Ok("opened on the attic TV", r.status == 200 && SignedIn(KIDN, "attic-tv"), Text(r));
+object replacement = null;
+world.OnLogout = () =>
+{
+    // A new /switch on the same TV records the same (device, account) again, newer.
+    var old = Entry(KIDN, "attic-tv");
+    if (old == null) return;
+    var copy = old.GetType().GetMethod("Copy").Invoke(old, null);
+    copy.GetType().GetProperty("EnteredUtc").SetValue(copy, DateTime.UtcNow.AddMinutes(5));
+    Entries().Remove(old);
+    Entries().Add(copy);
+    replacement = copy;
+    world.OnLogout = null;
+};
+r = Call("KickBonfireMember", OTHER, Body(("MemberId", MAIN)), "neighbour-phone");
+Ok("the kick signs the TV out", r.status == 200 && !SignedIn(KIDN, "attic-tv"), Text(r));
+Ok("but the entry recorded during the sign-out is not forgotten with the old one",
+   replacement != null && Entries().Contains(replacement));
+if (replacement != null) Entries().Remove(replacement);
+fires.Remove(g1);
+
 try { Directory.Delete(tempDir, true); } catch { }
 Console.WriteLine();
 if (fails.Count > 0)
@@ -238,6 +290,8 @@ public class World
     public List<Guid> Ended = new();
     public string Refusal;
     public bool DeviceRefusal;
+    public bool LogoutFails;
+    public Action OnLogout;
     public ISessionManager SessionManager;
 
     public void Add(Guid id, string name)
@@ -314,6 +368,8 @@ public class WorldProxy : DispatchProxy
                 W.End((string)args[0]);
                 return default(ValueTask);
             case "Logout" when args[0] is Device d:
+                if (W.LogoutFails) return Task.FromException(new InvalidOperationException("simulated Logout failure"));
+                W.OnLogout?.Invoke();
                 W.Logout(d);
                 return Task.CompletedTask;
             case "AuthenticateDirect":
