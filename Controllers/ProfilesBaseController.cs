@@ -2245,7 +2245,9 @@ namespace Jellyfin.Profiles.Controllers
             // holds another household's token; dropping it before Logout succeeds meant one
             // failed call (or a device manager that could not be asked) left the device
             // signed in with nothing left to retry it. So an entry goes only once every
-            // matching device is signed out, or a query that worked found none.
+            // matching device is signed out, or a query that worked found none. A kept entry is
+            // retried by the next pass that closes it again (a later sign-out sweep that still
+            // finds its door shut, or the profile's next PIN change), not by every change.
             var done = new List<CrossHouseholdEntry>();
             int signedOut = 0;
             foreach (var e in closed)
@@ -2265,7 +2267,7 @@ namespace Jellyfin.Profiles.Controllers
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "ProfilesPlugin: could not sign {ProfileId} out on device {DeviceId}; it stays listed and is tried again on the next change.", e.ProfileUserId, e.DeviceId);
+                    _logger.LogWarning(ex, "ProfilesPlugin: could not sign {ProfileId} out on device {DeviceId}; it stays listed and is tried again the next time this entry is closed.", e.ProfileUserId, e.DeviceId);
                 }
             }
 
