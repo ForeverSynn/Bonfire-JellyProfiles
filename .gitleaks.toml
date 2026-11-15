@@ -1,0 +1,20 @@
+# lsheardo fork: gitleaks config for the lsheardo-build workflow (full history scan).
+# Default rules stay on; only two upstream false positives are allowed, each narrowly.
+[extend]
+useDefault = true
+
+[[allowlists]]
+# Campground.Shared's vendoring manifest: SHA-256 hashes of the vendored source files
+# ("src/Security/SecretBox.cs": "<sha256>"), which CI checks. File names like SecretBox
+# trip generic-api-key; nothing in this file is a credential.
+description = "Campground.Shared vendored-file hash manifest"
+paths = ['''^Campground\.Shared/campground-shared\.json$''']
+
+[[allowlists]]
+# Upstream API documentation: the example response body shows a made-up 32-hex
+# activeProfileToken. Only that key, only in these two docs files.
+description = "Example activeProfileToken in upstream API docs"
+condition = "AND"
+paths = ['''^docs/(developer-api\.md|openapi\.json)$''']
+regexTarget = "line"
+regexes = ['''"activeProfileToken":\s*"[0-9a-f]{32}"''']

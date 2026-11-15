@@ -9,6 +9,18 @@ on:
 permissions:
   contents: read
 jobs:
+  gitleaks:
+    # Data-leak check on every server-related repo (full history, pinned image).
+    # .gitleaks.toml allows two upstream false positives (vendored-file hashes, an API docs example).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks (full history)
+        run: docker run --rm -v "$PWD":/src:ro -w /src zricethezav/gitleaks:v8.30.1 git . --redact --no-banner --exit-code 1 -c /src/.gitleaks.toml
   build:
     runs-on: ubuntu-latest
     steps:
