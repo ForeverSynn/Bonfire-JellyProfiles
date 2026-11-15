@@ -11,8 +11,7 @@ Works with Jellyfin 10.11 and 12.0. Part of [Campground](https://github.com/AHou
 
 ## Features
 
-- **Up to 20 profiles per account.** The default is five. Administrators can change the
-  limit for the whole server or for one account.
+- **Up to 20 profiles per account.** Five by default.
 - **Parental controls the server enforces.** Library access, allowed devices, rating
   limits and tag filters are applied by Jellyfin itself, so they hold in every app, including apps that
   can't show the switcher. Rating limits use your server country's ratings.
@@ -21,9 +20,7 @@ Works with Jellyfin 10.11 and 12.0. Part of [Campground](https://github.com/AHou
   appear on one switcher.
 - **Avatars.** Thirty built in, plus any images you upload for the whole server.
 - **Themes.** Twelve looks for Bonfire's screens, including high contrast and two that match
-  Jellyfin's own light and dark themes. Each profile can
-  have its own, set from **Settings → Theme** on the main account. Administrators choose
-  the default and can turn choosing off.
+  Jellyfin's own light and dark themes. Each profile can have its own.
 - **Six languages.** English, Catalan, French, Polish, Spanish and Turkish, following the
   language set in Jellyfin. [Add yours](Web/i18n/README.md).
 
@@ -47,10 +44,8 @@ Jellyfin Media Player, LG webOS 4.5 and later, and Samsung Tizen
 ([one-time setup](docs/troubleshooting.md#samsung-tizen)).
 
 **Profile sign-in:** Jellyfin for Android TV, Roku, Swiftfin, Findroid and Wholphin can
-list your profiles on their own sign-in screen. Turn it on under
-**Dashboard → Plugins → Bonfire → Clients**, and [set the app to ask every time](docs/clients.md#profile-sign-in). Type
-the profile's PIN where the app asks for a password. Android TV is confirmed on hardware;
-the others are not yet.
+list your profiles on their own sign-in screen ([setup](docs/clients.md#profile-sign-in)).
+Android TV is confirmed on hardware; the others are not yet.
 
 **Profile picker (beta):** Moonfin shows a Profiles folder on its home screen
 ([how it works](docs/clients.md#profile-picker-beta)). It's off by default and may change when native support arrives.
